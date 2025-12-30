@@ -120,4 +120,11 @@ if __name__ == "__main__":
         train_dfs=train_datasets,
         test_dfs=val_datasets
     )
+    
+    with pd.ExcelWriter('binning_verification_results.xlsx', engine='openpyxl') as writer:
+        df_single_train.to_excel(writer, sheet_name='1_Single_Train_Sets', index=False)
+        df_single_val.to_excel(writer, sheet_name='2_Single_Validation_Sets', index=False)
+        df_merge_train.to_excel(writer, sheet_name='3_Merged_Train_Sets', index=False)
+        df_merge_val.to_excel(writer, sheet_name='4_Merged_Validation_Sets', index=False)
+
 
