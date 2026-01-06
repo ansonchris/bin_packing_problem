@@ -1,0 +1,524 @@
+/* ================= Global Binning Parameters (Core for Debugging: Modify Only Here) ================= */
+%let a = 0.05;                /* Lower bound of bin proportion for single dataset */
+%let b = 0.25;                /* Upper bound of bin proportion for single dataset */
+%let C = 0.50;                /* Upper limit of sum of adjacent bin proportions */
+%let eps = 1e-7;              /* Floating-point comparison precision buffer */
+%let n_micro = 100;           /* Number of micro-bins */
+%let generate_test_data = 1;  /* 1=Generate random test data; 0=Use external data only */
+%let train_ds_list = Tr01 Tr02; /* List of training datasets (extend as needed) */
+%let test_ds_list = Te01 Te02;  /* List of test datasets (extend as needed) */
+
+/* ================= Generate Random Test Data (For Code Validation) ================= */
+%macro generate_test_datasets();
+    %if &generate_test_data. = 1 %then %do;
+        /* Generate training datasets (Tr01~Tr02) with pd/target fields */
+        data Tr01;
+            call streaminit(1);
+            do i = 1 to 2000;
+                s = rand("integer", 300, 850);
+                pd = 1 / (1 + exp((s - 580) / 50)); /* Probability of default (PD) */
+                target = rand("bernoulli", pd);     /* Binary target variable (0/1) */
+                output;
+            end;
+            drop i s;
+        run;
+
+        data Tr02;
+            call streaminit(2);
+            do i = 1 to 2000;
+                s = rand("integer", 300, 850);
+                pd = 1 / (1 + exp((s - 580) / 50));
+                target = rand("bernoulli", pd);
+                output;
+            end;
+            drop i s;
+        run;
+
+        /* Generate test datasets (Te01~Te02) with pd/target fields */
+        data Te01;
+            call streaminit(3);
+            do i = 1 to 1000;
+                s = rand("integer", 300, 850);
+                pd = 1 / (1 + exp((s - 580) / 50));
+                target = rand("bernoulli", pd);
+                output;
+            end;
+            drop i s;
+        run;
+
+        data Te02;
+            call streaminit(4);
+            do i = 1 to 1000;
+                s = rand("integer", 300, 850);
+                pd = 1 / (1 + exp((s - 580) / 50));
+                target = rand("bernoulli", pd);
+                output;
+            end;
+            drop i s;
+        run;
+
+        %put NOTE: Random test data generated successfully (Tr01/Tr02/Te01/Te02);
+    %end;
+%mend;
+%generate_test_datasets();
+
+/* ================= External Data Preparation (If Not Using Test Data) ================= */
+/* Rename your external datasets to match the naming convention (Tr01~TrN/Te01~TeN) */
+/* proc datasets lib=work nolist;
+    rename your_train_data1=Tr01 your_train_data2=Tr02;
+    rename your_test_data1=Te01 your_test_data2=Te02;
+run; */
+
+
+/* ================= Module 1: Parameter & Dataset Initialization (Debug-Friendly, Run Independently) ================= */
+proc iml;
+    /* 1. Import global macro parameters (Avoid hardcoding) */
+    a = &a; b = &b; C = &C; eps = &eps; n_micro = &n_micro;
+    
+    /* 2. Parse training/test dataset lists (Import from macro variables) */
+    train_ds = scan("&train_ds_list", 1:nwrd("&train_ds_list")); /* Convert to IML vector */
+    test_ds = scan("&test_ds_list", 1:nwrd("&test_ds_list"));
+    all_ds = train_ds // test_ds; /* Merge all datasets */
+    n_train = nrow(train_ds); n_test = nrow(test_ds);
+    
+    /* 3. Calculate total sample size of training/test datasets (Read external data) */
+    total_train_pop = 0; total_test_pop = 0;
+    /* Total samples of training datasets */
+    do i = 1 to n_train;
+        ds_name = train_ds[i];
+        use work.(ds_name) nobs n; /* Read sample size of external dataset */
+        close work.(ds_name);
+        total_train_pop = total_train_pop + n;
+    end;
+    /* Total samples of test datasets */
+    do i = 1 to n_test;
+        ds_name = test_ds[i];
+        use work.(ds_name) nobs n;
+        close work.(ds_name);
+        total_test_pop = total_test_pop + n;
+    end;
+    
+    /* 4. Save initialization results to macro variables (For subsequent module calls) */
+    call symputx("total_train_pop", total_train_pop);
+    call symputx("total_test_pop", total_test_pop);
+    call symputx("n_train", n_train);
+    call symputx("n_test", n_test);
+    
+    /* Debug output: Verify data reading correctness */
+    print "=== Dataset Initialization Debug Info ===";
+    print "Training Dataset List: " train_ds " Total Samples: " total_train_pop;
+    print "Test Dataset List: " test_ds " Total Samples: " total_test_pop;
+quit;
+
+
+/* ================= Module 2: Binning Metric Calculation (Core, Run Independently) ================= */
+proc iml;
+    /* 1. Re-import parameters (Necessary for modularization) */
+    a = &a; b = &b; C = &C; eps = &eps;
+    n_train = &n_train; n_test = &n_test;
+    total_train_pop = &total_train_pop; total_test_pop = &total_test_pop;
+    train_ds = scan("&train_ds_list", 1:nwrd("&train_ds_list"));
+    test_ds = scan("&test_ds_list", 1:nwrd("&test_ds_list"));
+    all_ds = train_ds // test_ds;
+    n_ds = nrow(all_ds);
+
+    /* ================= Core Module: get_bin_metrics (Independent Encapsulation, Debug-Friendly) ================= */
+    /* Input: low=Left bin boundary, high=Right bin boundary, is_last=Whether last bin */
+    /* Output: metrics=Metric matrix, valid=0/1 (Whether constraints are satisfied) */
+    start get_bin_metrics(low, high, is_last, valid);
+        /* Initialize single dataset metrics */
+        individual_props = j(n_ds, 1, .); /* Bin proportion of single dataset */
+        counts = j(n_ds, 1, 0);          /* Number of samples in bin */
+        bads = j(n_ds, 1, 0);            /* Number of bad samples in bin */
+
+        /* Iterate over all external datasets to calculate basic metrics */
+        do i = 1 to n_ds;
+            ds_name = all_ds[i];
+            /* Read pd/target from external dataset and filter by boundaries */
+            use work.(ds_name) var {pd target};
+            if is_last then read all where(pd >= low & pd <= high) into tmp;
+            else read all where(pd >= low & pd < high) into tmp;
+            close work.(ds_name);
+
+            /* Calculate total sample size of current dataset */
+            use work.(ds_name) nobs n; close work.(ds_name);
+
+            /* Populate metrics (Avoid division by zero) */
+            c = nrow(tmp);
+            b = sum(tmp[, 2]); /* target is in column 2 */
+            counts[i] = c;
+            bads[i] = b;
+            individual_props[i] = ifn(n>0, c/n, 0);
+            
+            /* Debug output: Calculation results of single dataset */
+            print "Dataset: " ds_name " Bin Range: [" low "," high "] Sample Count: " c " Bad Sample Count: " b;
+        end;
+
+        /* Constraint Check 1: All dataset proportions within [a-eps, b+eps] */
+        if any(individual_props < a - eps) | any(individual_props > b + eps) then do;
+            valid = 0;
+            print "Constraint Violation: Dataset proportion exceeds [a,b] range";
+            return (j(1, 6 + n_ds, .));
+        end;
+
+        /* Aggregate statistics (Training/Test datasets) */
+        train_count = sum(counts[1:n_train]);
+        train_bads = sum(bads[1:n_train]);
+        test_count = sum(counts[n_train+1:n_ds]);
+        test_bads = sum(bads[n_train+1:n_ds]);
+
+        /* Bad rate calculation (Avoid division by zero) */
+        agg_tr_br = ifn(train_count>0, train_bads/train_count, 0);
+        agg_ts_br = ifn(test_count>0, test_bads/test_count, 0);
+
+        /* Average bad rate of test datasets */
+        test_set_brs = j(n_test, 1, 0);
+        do i = 1 to n_test;
+            idx = n_train + i;
+            test_set_brs[i] = ifn(counts[idx]>0, bads[idx]/counts[idx], 0);
+        end;
+        avg_ts_br = mean(test_set_brs);
+
+        /* Aggregate proportions */
+        agg_tr_prop = train_count / total_train_pop;
+        agg_ts_prop = test_count / total_test_pop;
+
+        /* Output metric matrix (Columns: individual_props + aggregate metrics) */
+        metrics = individual_props` || agg_tr_prop || agg_ts_prop || agg_tr_br || agg_ts_br || avg_ts_br;
+        valid = 1;
+        return (metrics);
+    finish get_bin_metrics;
+
+    /* [Debug Case] Test get_bin_metrics (Optional, Verify core logic) */
+    /* Example: Test bin range [0.1, 0.2], not last bin */
+    low = 0.1; high = 0.2; is_last = 0; valid = 0;
+    test_metrics = get_bin_metrics(low, high, is_last, valid);
+    print "=== get_bin_metrics Debug Results ===";
+    print "Is Valid: " valid " Metric Matrix: " test_metrics;
+
+quit;
+
+
+/* ================= Module 3: DP Solving + Recursive Repair (Binning Core, Easy to Debug After Splitting) ================= */
+proc iml;
+    /* 1. Import parameters and dataset information */
+    a = &a; b = &b; C = &C; eps = &eps; n_micro = &n_micro;
+    n_train = &n_train; n_test = &n_test;
+    total_train_pop = &total_train_pop; total_test_pop = &total_test_pop;
+    train_ds = scan("&train_ds_list", 1:nwrd("&train_ds_list"));
+    test_ds = scan("&test_ds_list", 1:nwrd("&test_ds_list"));
+    all_ds = train_ds // test_ds;
+    n_ds = nrow(all_ds);
+
+    /* 2. Import core module: get_bin_metrics (Must load first) */
+    start get_bin_metrics(low, high, is_last, valid);
+        individual_props = j(n_ds, 1, .);
+        counts = j(n_ds, 1, 0);
+        bads = j(n_ds, 1, 0);
+
+        do i = 1 to n_ds;
+            ds_name = all_ds[i];
+            use work.(ds_name) var {pd target};
+            if is_last then read all where(pd >= low & pd <= high) into tmp;
+            else read all where(pd >= low & pd < high) into tmp;
+            close work.(ds_name);
+
+            use work.(ds_name) nobs n; close work.(ds_name);
+            c = nrow(tmp);
+            b = sum(tmp[, 2]);
+            counts[i] = c;
+            bads[i] = b;
+            individual_props[i] = ifn(n>0, c/n, 0);
+        end;
+
+        if any(individual_props < a - eps) | any(individual_props > b + eps) then do;
+            valid = 0;
+            return (j(1, 6 + n_ds, .));
+        end;
+
+        train_count = sum(counts[1:n_train]);
+        train_bads = sum(bads[1:n_train]);
+        test_count = sum(counts[n_train+1:n_ds]);
+        test_bads = sum(bads[n_train+1:n_ds]);
+
+        agg_tr_br = ifn(train_count>0, train_bads/train_count, 0);
+        agg_ts_br = ifn(test_count>0, test_bads/test_count, 0);
+
+        test_set_brs = j(n_test, 1, 0);
+        do i = 1 to n_test;
+            idx = n_train + i;
+            test_set_brs[i] = ifn(counts[idx]>0, bads[idx]/counts[idx], 0);
+        end;
+        avg_ts_br = mean(test_set_brs);
+
+        agg_tr_prop = train_count / total_train_pop;
+        agg_ts_prop = test_count / total_test_pop;
+
+        metrics = individual_props` || agg_tr_prop || agg_ts_prop || agg_tr_br || agg_ts_br || avg_ts_br;
+        valid = 1;
+        return (metrics);
+    finish get_bin_metrics;
+
+    /* ================= Submodule 1: DP Solving (Stage 1) ================= */
+    start solve_stage1(bin_edges, stage1_cuts);
+        /* Step 1: Merge pd from all external datasets to generate micro-bin boundaries */
+        /* Read pd from first dataset */
+        use work.(all_ds[1]) var {pd}; read all into all_pd; close work.(all_ds[1]);
+        /* Merge pd from remaining datasets */
+        do i = 2 to n_ds;
+            use work.(all_ds[i]) var {pd}; read all into tmp_pd; close work.(all_ds[i]);
+            all_pd = all_pd // tmp_pd;
+        end;
+
+        /* Generate n_micro quantile boundaries (Deduplicate + Sort) */
+        call qntl(bin_edges, all_pd, (1:n_micro)/(n_micro+1));
+        bin_edges = unique(bin_edges); call sort(bin_edges); bin_edges = bin_edges`;
+        n_edges = nrow(bin_edges);
+        print "=== DP Solving Debug Info ===";
+        print "Number of Micro-Bin Boundaries: " n_edges " Boundary Values: " bin_edges;
+
+        /* Step 2: Initialize DP state chain (Store to dataset for debug viewing) */
+        create work.chain var {start end len prev_start prev_end};
+        append from j(1, 5, .) / nosymbols; close work.chain;
+
+        /* Step 3: Double loop to build state chain */
+        do j = 2 to n_edges;
+            high = bin_edges[j];
+            do i = 1 to j - 1;
+                low = bin_edges[i];
+                is_last = ifn(j = n_edges, 1, 0);
+                valid = 0;
+                metrics = get_bin_metrics(low, high, is_last, valid);
+                if valid = 0 then continue;
+
+                /* Case 1: i=1, path length=1 */
+                if i = 1 then do;
+                    start_idx = i; end_idx = j; len = 1; prev_start = .; prev_end = .;
+                    create work.tmp_chain var {start_idx end_idx len prev_start prev_end};
+                    append from start_idx end_idx len prev_start prev_end; close work.tmp_chain;
+                    proc append base=work.chain data=work.tmp_chain force; run;
+                    continue;
+                end;
+
+                /* Case 2: i>1, find predecessors */
+                use work.chain where(end = i); read all var {start end len} into prev_states; close work.chain;
+                if nrow(prev_states) = 0 then continue;
+
+                /* Iterate over predecessors to check constraints */
+                best_len = -1; best_prev_start = .; best_prev_end = .;
+                do p = 1 to nrow(prev_states);
+                    prev_start = prev_states[p, 1]; prev_end = prev_states[p, 2]; prev_len = prev_states[p, 3];
+                    /* Read predecessor metrics */
+                    prev_low = bin_edges[prev_start]; prev_high = bin_edges[prev_end];
+                    prev_metrics = get_bin_metrics(prev_low, prev_high, 0, valid);
+                    if valid = 0 then continue;
+
+                    /* Monotonicity + Adjacent sum check */
+                    curr_tr_br = metrics[1, 4]; curr_ts_br = metrics[1, 5]; curr_avg_br = metrics[1, 6];
+                    prev_tr_br = prev_metrics[1, 4]; prev_ts_br = prev_metrics[1, 5]; prev_avg_br = prev_metrics[1, 6];
+                    curr_props = metrics[1, 1:n_ds]; prev_props = prev_metrics[1, 1:n_ds];
+
+                    mono_ok = (curr_tr_br >= prev_tr_br - eps) & (curr_ts_br >= prev_ts_br - eps) & (curr_avg_br >= prev_avg_br - eps);
+                    sum_props = prev_props + curr_props;
+                    adj_ok = all(sum_props <= C + eps);
+
+                    if mono_ok & adj_ok & prev_len > best_len then do;
+                        best_len = prev_len; best_prev_start = prev_start; best_prev_end = prev_end;
+                    end;
+                end;
+
+                /* Save optimal state */
+                if best_len > 0 then do;
+                    start_idx = i; end_idx = j; len = best_len + 1;
+                    prev_start = best_prev_start; prev_end = best_prev_end;
+                    create work.tmp_chain var {start_idx end_idx len prev_start prev_end};
+                    append from start_idx end_idx len prev_start prev_end; close work.tmp_chain;
+                    proc append base=work.chain data=work.tmp_chain force; run;
+                end;
+            end;
+        end;
+
+        /* Step 4: Backtrack optimal path */
+        use work.chain where(end = n_edges) order by len desc;
+        read all var {start end} into final_state; close work.chain;
+        if nrow(final_state) = 0 then do;
+            stage1_cuts = j(1, 0, .);
+            print "ERROR: No valid binning path in Stage1";
+            return;
+        end;
+
+        /* Backtrack to generate Stage1 bin boundaries */
+        curr_start = final_state[1, 1]; curr_end = final_state[1, 2];
+        path = curr_start || curr_end;
+        do while(curr_start ^= .);
+            use work.chain where(start = curr_start & end = curr_end);
+            read all var {prev_start prev_end} into prev; close work.chain;
+            if nrow(prev) = 0 then leave;
+            curr_start = prev[1, 1]; curr_end = prev[1, 2];
+            if curr_start ^= . then path = path // (curr_start || curr_end);
+        end;
+
+        stage1_cuts = bin_edges[path[nrow(path), 1]];
+        do i = nrow(path) downto 1;
+            stage1_cuts = stage1_cuts || bin_edges[path[i, 2]];
+        end;
+        stage1_cuts = unique(stage1_cuts);
+        print "Stage1 Bin Boundaries: " stage1_cuts;
+    finish solve_stage1;
+
+    /* ================= Submodule 2: Recursive Repair (Stage 2) ================= */
+    start repair_recursive(init_cuts, final_cuts);
+        max_iter = 100; curr_iter = 0; curr_cuts = init_cuts; final_cuts = init_cuts;
+
+        do while(curr_iter < max_iter);
+            n_cuts = ncol(curr_cuts); n_bins = n_cuts - 1;
+            violation_idx = .; stats = j(n_bins, 6 + n_ds, .);
+
+            /* Check current binning */
+            do bin = 1 to n_bins;
+                low = curr_cuts[bin]; high = curr_cuts[bin + 1];
+                is_last = ifn(bin = n_bins, 1, 0); valid = 0;
+                metrics = get_bin_metrics(low, high, is_last, valid);
+                if valid = 0 then do;
+                    violation_idx = bin;
+                    print "Repair Debug: Bin " bin " violated constraints, trigger repair";
+                    leave;
+                end;
+                stats[bin, ] = metrics;
+            end;
+
+            /* Exit if no violations */
+            if violation_idx = . then do;
+                final_cuts = curr_cuts;
+                break;
+            end;
+
+            /* Generate merge strategies */
+            cuts_L = j(1, 0, .); cuts_R = j(1, 0, .); cuts_LL = j(1, 0, .);
+            /* Strategy L: Remove boundary at violation_idx */
+            do i = 1 to n_cuts; if i ^= violation_idx then cuts_L = cuts_L || curr_cuts[i]; end;
+            /* Strategy R: Remove boundary at violation_idx+1 */
+            if violation_idx < n_cuts - 1 then do;
+                do i = 1 to n_cuts; if i ^= violation_idx + 1 then cuts_R = cuts_R || curr_cuts[i]; end;
+            end;
+            /* Strategy LL: Remove boundary at violation_idx-1 */
+            if violation_idx >= 2 then do;
+                do i = 1 to n_cuts; if i ^= violation_idx - 1 then cuts_LL = cuts_LL || curr_cuts[i]; end;
+            end;
+
+            /* Select strategy with maximum number of bins */
+            candidates = j(1, 0, .);
+            if ncol(cuts_L) > 1 then candidates = candidates || cuts_L;
+            if ncol(cuts_R) > 1 then candidates = candidates || cuts_R;
+            if ncol(cuts_LL) > 1 then candidates = candidates || cuts_LL;
+            if ncol(candidates) = 0 then do;
+                final_cuts = j(1, 0, .);
+                print "ERROR: No valid repair strategy";
+                return;
+            end;
+
+            max_bins = -1; next_cuts = j(1, 0, .);
+            do c = 1 to ncol(candidates) by n_cuts - 1;
+                cut_group = candidates[c:(c + ncol(cuts_L) - 1)];
+                n_bins_curr = ncol(cut_group) - 1;
+                if n_bins_curr > max_bins then do;
+                    max_bins = n_bins_curr;
+                    next_cuts = cut_group;
+                end;
+            end;
+
+            curr_cuts = next_cuts; curr_iter = curr_iter + 1;
+            print "Repair Debug: Iteration " curr_iter ", New Bin Boundaries: " curr_cuts;
+        end;
+
+        final_cuts = curr_cuts;
+        print "Repair Completed, Final Bin Boundaries: " final_cuts;
+    finish repair_recursive;
+
+    /* ================= Main Call Logic ================= */
+    /* 1. Execute DP Solving */
+    declare double bin_edges[] stage1_cuts[] final_cuts[];
+    call solve_stage1(bin_edges, stage1_cuts);
+
+    /* 2. Execute Recursive Repair */
+    if ncol(stage1_cuts) > 0 then call repair_recursive(stage1_cuts, final_cuts);
+    else final_cuts = j(1, 0, .);
+
+    /* 3. Save final bin boundaries to macro variable (For subsequent output) */
+    if ncol(final_cuts) > 0 then do;
+        cuts_str = char(final_cuts, 8); /* Convert to string */
+        cuts_str = translate(cats(cuts_str), " ", "|"); /* Replace delimiter */
+        call symputx("final_cuts_str", cuts_str);
+    end;
+
+quit;
+
+
+/* ================= Module 4: Result Output (Independent Module, Only Process Final Results) ================= */
+proc iml;
+    /* Import final bin boundaries */
+    final_cuts = scan("&final_cuts_str", 1:nwrd("&final_cuts_str"));
+    final_cuts = input(final_cuts, 8.); /* Convert back to numeric */
+    n_cuts = nrow(final_cuts); n_bins = n_cuts - 1;
+
+    /* Import dataset information */
+    n_train = &n_train; n_test = &n_test;
+    train_ds = scan("&train_ds_list", 1:nwrd("&train_ds_list"));
+    test_ds = scan("&test_ds_list", 1:nwrd("&test_ds_list"));
+    all_ds = train_ds // test_ds;
+
+    /* ================= Final Report Output ================= */
+    print "=" repeat("-", 98) "=";
+    print "FINAL BINNING AUDIT REPORT (External Data Version)";
+    print "=" repeat("-", 98) "=";
+
+    if n_bins < 1 then do;
+        print "ERROR: No valid binning results";
+        quit;
+    end;
+
+    /* Generate bin labels */
+    bin_labels = j(n_bins, 1, "");
+    do i = 1 to n_bins;
+        low = final_cuts[i]; high = final_cuts[i + 1];
+        if i = n_bins then bin_labels[i] = cats("[", low:0.2f, ", ", high:0.2f, "]");
+        else bin_labels[i] = cats("[", low:0.2f, ", ", high:0.2f, ")");
+    end;
+
+    /* Print core metrics of each bin */
+    do bin = 1 to n_bins;
+        low = final_cuts[bin]; high = final_cuts[bin + 1];
+        is_last = ifn(bin = n_bins, 1, 0);
+        /* Read external data to calculate metrics (Simplified version, reuse core logic of get_bin_metrics) */
+        use work.(all_ds[1]) var {pd target};
+        if is_last then read all where(pd >= low & pd <= high) into tmp;
+        else read all where(pd >= low & pd < high) into tmp;
+        close work.(all_ds[1]);
+
+        /* Simplified output of core metrics */
+        total_cnt = nrow(tmp); bad_cnt = sum(tmp[, 2]);
+        bad_rate = ifn(total_cnt>0, bad_cnt/total_cnt, 0);
+        print "BIN " bin ":" bin_labels[bin] " Sample Count: " total_cnt " Bad Rate: " bad_rate:0.4f;
+    end;
+
+    /* Generate validation datasets (Single/Merged) */
+    /* 1. Single training dataset statistics */
+    create work.single_train var {dataset_id bin_interval customer_count};
+    do i = 1 to n_train;
+        ds_name = train_ds[i];
+        dataset_id = ds_name;
+        do bin = 1 to n_bins;
+            low = final_cuts[bin]; high = final_cuts[bin + 1];
+            is_last = ifn(bin = n_bins, 1, 0);
+            use work.(ds_name) where(pd >= low & (pd <= high & is_last | pd < high & ~is_last));
+            read all var {pd} into tmp; close work.(ds_name);
+            customer_count = nrow(tmp);
+            bin_interval = bin_labels[bin];
+            append from dataset_id bin_interval customer_count;
+        end;
+    end;
+    close work.single_train;
+
+    print "=== Result Output Completed ===";
+    print "Validation Dataset Generated: work.single_train";
+quit;

@@ -1,0 +1,654 @@
+/* ============================================= */
+/* PART 1: DATA PREPARATION AND READING */
+/* ============================================= */
+
+/* 1. Read all training datasets and compute total population */
+%macro read_train_datasets;
+    /* Assume training data sets are in work.train1, work.train2, ..., work.train10 */
+    %do i = 1 %to 10;
+        data train&i;
+            set work.train&i; /* Or use your actual data set location */
+            dataset_id = "Tr&i";
+            keep dataset_id pd target;
+        run;
+        
+        /* Compute size of each data set */
+        proc sql noprint;
+            select count(*) into :train&i._size
+            from train&i;
+        quit;
+    %end;
+%mend read_train_datasets;
+
+%macro read_test_datasets;
+    /* Assume testing data sets are in work.test1, work.test2, ..., work.test6 */
+    %do i = 1 %to 6;
+        data test&i;
+            set work.test&i; /* Or use your actual data set location */
+            dataset_id = "Ts&i";
+            keep dataset_id pd target;
+        run;
+        
+        /* Compute size of each data set */
+        proc sql noprint;
+            select count(*) into :test&i._size
+            from test&i;
+        quit;
+    %end;
+%mend read_test_datasets;
+
+/* 2. Combine all datasets to compute quantile boundaries */
+%macro combine_datasets;
+    data combined;
+        set 
+        %do i = 1 %to 10;
+            train&i(in=tr)
+        %end;
+        %do i = 1 %to 6;
+            test&i(in=ts)
+        %end;
+        ;
+        if tr then type = 'train';
+        else if ts then type = 'test';
+    run;
+    
+    /* Compute quantile boundaries */
+    proc univariate data=combined noprint;
+        var pd;
+        output out=bin_edges pctlpts=0 to 100 by 0.5 pctlpre=p_;
+    run;
+    
+    /* Transpose into a single row */
+    proc transpose data=bin_edges out=edges_t;
+    run;
+    
+    /* Create list of bin boundaries */
+    data bin_edges_list;
+        set edges_t;
+        where _NAME_ like 'p_%';
+        rename col1 = bin_edge;
+        keep col1;
+    run;
+    
+    /* Save as SAS data set */
+    data work.bin_edges_final;
+        set bin_edges_list;
+    run;
+%mend combine_datasets;
+
+/* 3. Main data preparation routine */
+%macro prepare_data;
+    %put Start reading training data sets...;
+    %read_train_datasets;
+    
+    %put Start reading testing data sets...;
+    %read_test_datasets;
+    
+    %put Combining data sets and computing quantile boundaries...;
+    %combine_datasets;
+    
+    %put Data preparation completed!;
+%mend prepare_data;
+
+/* Execute data preparation */
+%prepare_data;
+
+/* ============================================= */
+/* PART 2: CORE ALGORITHM - PROC IML */
+/* ============================================= */
+
+proc iml;
+/* 1. Define function to calculate bin metrics */
+start get_bin_metrics(train_dfs, test_dfs, total_train_pop, total_test_pop, 
+                      a, b, C, eps, bin_low, bin_high, is_last);
+    /* Parameters:
+       train_dfs: List of training data sets (as matrix list)
+       test_dfs: List of testing data sets (as matrix list)
+       total_train_pop: Total number of samples in training sets
+       total_test_pop: Total number of samples in testing sets
+       a, b, C: Constraint parameters
+       eps: Tolerance
+       bin_low, bin_high: Bin boundaries
+       is_last: Flag indicating if this is the last bin
+    */
+    
+    n_train = ncol(train_dfs);
+    n_test = ncol(test_dfs);
+    n_all = n_train + n_test;
+    
+    /* Initialize result arrays */
+    individual_props = J(1, n_all, 0);
+    counts = J(1, n_all, 0);
+    bads = J(1, n_all, 0);
+    
+    /* Process training data sets */
+    do i = 1 to n_train;
+        df = train_dfs[i];
+        pd = df[,1];
+        target = df[,2];
+        
+        /* Select samples based on boundaries */
+        if is_last then do;
+            mask = (pd >= bin_low) & (pd <= bin_high);
+        end;
+        else do;
+            mask = (pd >= bin_low) & (pd < bin_high);
+        end;
+        
+        c = sum(mask);
+        if c > 0 then do;
+            b_val = sum(target[loc(mask)]);
+        end;
+        else do;
+            b_val = 0;
+        end;
+        
+        individual_props[i] = c / nrow(df);
+        counts[i] = c;
+        bads[i] = b_val;
+    end;
+    
+    /* Process testing data sets */
+    do i = 1 to n_test;
+        df_idx = i + n_train;
+        df = test_dfs[i];
+        pd = df[,1];
+        target = df[,2];
+        
+        /* Select samples based on boundaries */
+        if is_last then do;
+            mask = (pd >= bin_low) & (pd <= bin_high);
+        end;
+        else do;
+            mask = (pd >= bin_low) & (pd < bin_high);
+        end;
+        
+        c = sum(mask);
+        if c > 0 then do;
+            b_val = sum(target[loc(mask)]);
+        end;
+        else do;
+            b_val = 0;
+        end;
+        
+        individual_props[df_idx] = c / nrow(df);
+        counts[df_idx] = c;
+        bads[df_idx] = b_val;
+    end;
+    
+    /* Check Condition 1: Each dataset proportion must be between a and b */
+    if any(individual_props < a - eps) | any(individual_props > b + eps) then do;
+        return(.);
+    end;
+    
+    /* Compute aggregate statistics */
+    train_count = sum(counts[1:n_train]);
+    train_bads = sum(bads[1:n_train]);
+    test_count = sum(counts[(n_train+1):n_all]);
+    test_bads = sum(bads[(n_train+1):n_all]);
+    
+    /* Compute bad rates */
+    agg_tr_br = 0;
+    if train_count > 0 then agg_tr_br = train_bads / train_count;
+    
+    agg_ts_br = 0;
+    if test_count > 0 then agg_ts_br = test_bads / test_count;
+    
+    /* Compute average bad rate across testing sets */
+    test_set_brs = J(1, n_test, 0);
+    do i = 1 to n_test;
+        idx = n_train + i;
+        if counts[idx] > 0 then
+            test_set_brs[i] = bads[idx] / counts[idx];
+    end;
+    avg_ts_br = mean(test_set_brs);
+    
+    /* Compute aggregate proportions */
+    agg_tr_prop = train_count / total_train_pop;
+    agg_ts_prop = test_count / total_test_pop;
+    
+    /* Return result matrix */
+    result = individual_props || agg_tr_prop || agg_ts_prop || 
+             agg_tr_br || agg_ts_br || avg_ts_br;
+    
+    return(result);
+finish;
+
+/* 2. Dynamic programming solution function */
+start solve_stage1(bin_edges, train_dfs, test_dfs, total_train_pop, 
+                  total_test_pop, a, b, C, eps);
+    n = nrow(bin_edges) - 1;
+    
+    /* DP tables */
+    chains = J(n+1, n+1, 0);  /* Store maximum length */
+    pred = J(n+1, n+1, -1);   /* Store predecessor, -1 means no predecessor */
+    
+    print "Start dynamic programming solution, number of bins: " n;
+    
+    /* Main DP loop */
+    do j = 1 to n;
+        do i = 0 to j-1;
+            low = bin_edges[i+1];
+            high = bin_edges[j+1];
+            is_last = (j == n);
+            
+            /* Calculate current bin metrics */
+            metrics = get_bin_metrics(train_dfs, test_dfs, total_train_pop,
+                                     total_test_pop, a, b, C, eps,
+                                     low, high, is_last);
+            
+            /* If bin is invalid, skip */
+            if ismissing(metrics[1]) then continue;
+            
+            /* If i=0, this is the first bin */
+            if i = 0 then do;
+                chains[i+1, j+1] = 1;
+                pred[i+1, j+1] = -1;
+            end;
+            else do;
+                /* Find optimal predecessor */
+                best_len = -1;
+                best_k = -1;
+                
+                do k = 0 to i-1;
+                    if chains[k+1, i+1] > 0 then do;
+                        prev_low = bin_edges[k+1];
+                        prev_high = bin_edges[i+1];
+                        
+                        /* Get metrics of previous bin */
+                        prev_metrics = get_bin_metrics(train_dfs, test_dfs,
+                                                      total_train_pop,
+                                                      total_test_pop,
+                                                      a, b, C, eps,
+                                                      prev_low, prev_high, 0);
+                        
+                        if ismissing(prev_metrics[1]) then continue;
+                        
+                        /* Check monotonicity constraints */
+                        if metrics[4] <= prev_metrics[4] - eps then continue;
+                        if metrics[5] <= prev_metrics[5] - eps then continue;
+                        if metrics[6] <= prev_metrics[6] - eps then continue;
+                        
+                        /* Check adjacent bin sum constraint */
+                        if any(prev_metrics[1] + metrics[1] > C + eps) then continue;
+                        
+                        /* Update optimal solution */
+                        if chains[k+1, i+1] > best_len then do;
+                            best_len = chains[k+1, i+1];
+                            best_k = k;
+                        end;
+                    end;
+                end;
+                
+                /* If a valid predecessor is found */
+                if best_k >= 0 then do;
+                    chains[i+1, j+1] = best_len + 1;
+                    pred[i+1, j+1] = best_k;
+                end;
+            end;
+        end;
+    end;
+    
+    /* Backtrack to find optimal path */
+    max_len = 0;
+    end_node = -1;
+    
+    do i = 0 to n-1;
+        if chains[i+1, n+1] > max_len then do;
+            max_len = chains[i+1, n+1];
+            end_node = i;
+        end;
+    end;
+    
+    if max_len = 0 then do;
+        print "No valid binning solution found";
+        return({});
+    end;
+    
+    print "Valid binning solution found, number of bins: " max_len;
+    
+    /* Reconstruct bin boundaries */
+    cutoffs = bin_edges[1];  /* Start from minimum value */
+    current = end_node;
+    
+    do while (current >= 0);
+        cutoffs = cutoffs // bin_edges[current+2];
+        current = pred[current+1, n+1];
+    end;
+    
+    /* Reverse boundaries */
+    n_cuts = nrow(cutoffs);
+    reversed_cuts = J(n_cuts, 1, 0);
+    do i = 1 to n_cuts;
+        reversed_cuts[i] = cutoffs[n_cuts - i + 1];
+    end;
+    
+    return(reversed_cuts);
+finish;
+
+/* 3. Recursive repair function */
+start repair_recursive(cutoffs, train_dfs, test_dfs, total_train_pop,
+                      total_test_pop, a, b, C, eps, depth=0);
+    n_cuts = nrow(cutoffs);
+    
+    /* If too few bins, return empty */
+    if n_cuts < 2 then return(.);
+    
+    /* Compute metrics for each bin */
+    stats = J(6, n_cuts-1, .);  /* Each column stores 6 metrics for one bin */
+    
+    do i = 1 to n_cuts-1;
+        low = cutoffs[i];
+        high = cutoffs[i+1];
+        is_last = (i == n_cuts-1);
+        
+        metrics = get_bin_metrics(train_dfs, test_dfs, total_train_pop,
+                                 total_test_pop, a, b, C, eps,
+                                 low, high, is_last);
+        
+        if ismissing(metrics[1]) then return(.);
+        
+        stats[, i] = metrics`;
+    end;
+    
+    /* Check for violations */
+    violation_idx = .;
+    do i = 2 to n_cuts-1;
+        prev = stats[, i-1];
+        curr = stats[, i];
+        
+        /* Check monotonicity */
+        mono_fail = (curr[4] <= prev[4] - eps) |
+                    (curr[5] <= prev[5] - eps) |
+                    (curr[6] <= prev[6] - eps);
+        
+        /* Check adjacent bin sum */
+        n_datasets = ncol(train_dfs) + ncol(test_dfs);
+        adj_fail = any(prev[1:n_datasets] + curr[1:n_datasets] > C + eps);
+        
+        if mono_fail | adj_fail then do;
+            violation_idx = i;
+            leave;
+        end;
+    end;
+    
+    /* If no violations found, return current bins */
+    if ismissing(violation_idx) then return(cutoffs);
+    
+    /* Recursively try three repair strategies */
+    results = {};
+    
+    /* Strategy 1: Merge violating bin with left neighbor */
+    cuts_l = cutoffs[1:(violation_idx-1)] // cutoffs[(violation_idx+1):n_cuts];
+    res_l = repair_recursive(cuts_l, train_dfs, test_dfs, total_train_pop,
+                            total_test_pop, a, b, C, eps, depth+1);
+    if ^ismissing(res_l[1]) then results = results || res_l;
+    
+    /* Strategy 2: Merge violating bin with right neighbor */
+    if violation_idx < n_cuts-1 then do;
+        cuts_r = cutoffs[1:violation_idx] // cutoffs[(violation_idx+2):n_cuts];
+        res_r = repair_recursive(cuts_r, train_dfs, test_dfs, total_train_pop,
+                                total_test_pop, a, b, C, eps, depth+1);
+        if ^ismissing(res_r[1]) then results = results || res_r;
+    end;
+    
+    /* Strategy 3: Merge two bins to the left of violating bin */
+    if violation_idx >= 3 then do;
+        cuts_ll = cutoffs[1:(violation_idx-2)] // cutoffs[violation_idx:n_cuts];
+        res_ll = repair_recursive(cuts_ll, train_dfs, test_dfs, total_train_pop,
+                                 total_test_pop, a, b, C, eps, depth+1);
+        if ^ismissing(res_ll[1]) then results = results || res_ll;
+    end;
+    
+    /* Choose solution with maximum number of bins */
+    if ncol(results) = 0 then return(.);
+    
+    max_bins = 0;
+    best_result = .;
+    do i = 1 to ncol(results);
+        res = results[, i];
+        n_bins = nrow(res) - 1;
+        if n_bins > max_bins then do;
+            max_bins = n_bins;
+            best_result = res;
+        end;
+    end;
+    
+    return(best_result);
+finish;
+
+/* 4. Main execution routine */
+/* Read bin boundaries */
+use work.bin_edges_final;
+read all var {bin_edge} into bin_edges;
+close work.bin_edges_final;
+
+/* Read training data sets into IML matrices */
+train_dfs = {};
+total_train_pop = 0;
+%do i = 1 %to 10;
+    use work.train&i;
+    read all var {pd target} into df&i;
+    close work.train&i;
+    
+    train_dfs = train_dfs || df&i;
+    total_train_pop = total_train_pop + nrow(df&i);
+%end;
+
+/* Read testing data sets into IML matrices */
+test_dfs = {};
+total_test_pop = 0;
+%do i = 1 %to 6;
+    use work.test&i;
+    read all var {pd target} into tdf&i;
+    close work.test&i;
+    
+    test_dfs = test_dfs || tdf&i;
+    total_test_pop = total_test_pop + nrow(tdf&i);
+%end;
+
+/* Set constraint parameters */
+a = 0.05;
+b = 0.25;
+C = 0.50;
+eps = 1e-7;
+
+print "Data set statistics:";
+print "Number of training sets: " ncol(train_dfs);
+print "Number of testing sets: " ncol(test_dfs);
+print "Total training samples: " total_train_pop;
+print "Total testing samples: " total_test_pop;
+print "Number of bin boundaries: " nrow(bin_edges);
+
+/* Stage 1: Dynamic programming solution */
+stage1_cuts = solve_stage1(bin_edges, train_dfs, test_dfs, 
+                          total_train_pop, total_test_pop,
+                          a, b, C, eps);
+
+if nrow(stage1_cuts) > 1 then do;
+    print "Stage 1 completed, found bin boundaries:";
+    print stage1_cuts;
+    
+    /* Stage 2: Recursive repair */
+    print "Starting Stage 2: Recursive repair...";
+    final_cuts = repair_recursive(stage1_cuts, train_dfs, test_dfs,
+                                 total_train_pop, total_test_pop,
+                                 a, b, C, eps);
+    
+    if ^ismissing(final_cuts[1]) then do;
+        print "=" || repeat("=", 79);
+        print "Final Binning Report";
+        print "=" || repeat("=", 79);
+        print "Bin boundaries:";
+        print final_cuts;
+        
+        n_bins = nrow(final_cuts) - 1;
+        print "Total number of bins: " n_bins;
+        
+        /* Validate each bin */
+        do i = 1 to n_bins;
+            low = final_cuts[i];
+            high = final_cuts[i+1];
+            is_last = (i == n_bins);
+            
+            metrics = get_bin_metrics(train_dfs, test_dfs, total_train_pop,
+                                     total_test_pop, a, b, C, eps,
+                                     low, high, is_last);
+            
+            print "Bin " (i) ": [" (round(low, 0.01)) ", " (round(high, 0.01)) "]";
+            print "  Aggregate proportion - Training: " (round(metrics[2]*100, 0.01)) "%";
+            print "  Aggregate proportion - Testing: " (round(metrics[3]*100, 0.01)) "%";
+            print "  Bad rate - Training: " (round(metrics[4], 0.0001));
+            print "  Bad rate - Testing: " (round(metrics[5], 0.0001));
+            print "  Average testing bad rate: " (round(metrics[6], 0.0001));
+            
+            if i > 1 then do;
+                /* Get metrics of previous bin */
+                prev_low = final_cuts[i-1];
+                prev_high = final_cuts[i];
+                prev_metrics = get_bin_metrics(train_dfs, test_dfs, total_train_pop,
+                                              total_test_pop, a, b, C, eps,
+                                              prev_low, prev_high, 0);
+                
+                /* Check monotonicity */
+                monotonic = (metrics[4] > prev_metrics[4]) &
+                           (metrics[5] > prev_metrics[5]) &
+                           (metrics[6] > prev_metrics[6]);
+                
+                print "  Monotonicity check: " (choose(monotonic, "Pass", "Fail"));
+            end;
+            print repeat("-", 80);
+        end;
+        
+        /* Save final bin boundaries to SAS data set */
+        create work.final_cutoffs from final_cuts[colname={'cutoff'}];
+        append from final_cuts;
+        close work.final_cutoffs;
+        
+        print "Bin boundaries saved to work.final_cutoffs";
+    end;
+    else do;
+        print "No valid binning solution found after recursive repair";
+    end;
+end;
+else do;
+    print "Stage 1 did not find a valid binning solution";
+end;
+
+quit;
+
+/* ============================================= */
+/* PART 3: VALIDATION AND REPORT OUTPUT */
+/* ============================================= */
+
+/* 1. Read final bin boundaries */
+proc sql noprint;
+    select cutoff into :cutoff1-:cutoff999
+    from work.final_cutoffs
+    order by cutoff;
+    
+    select count(*) into :n_cutoffs
+    from work.final_cutoffs;
+quit;
+
+/* 2. Calculate bin statistics for each data set */
+%macro calculate_bin_stats;
+    /* Create reports for training sets */
+    %do i = 1 %to 10;
+        data train&i._binned;
+            set work.train&i;
+            length bin_range $50;
+            
+            /* Assign bins */
+            %do j = 1 %to %eval(&n_cutoffs-1);
+                %let next = %eval(&j+1);
+                if &&cutoff&j <= pd < &&cutoff&next then 
+                    bin_range = "&&cutoff&j - &&cutoff&next";
+            %end;
+            
+            /* Last bin includes upper bound */
+            if pd >= &&cutoff&n_cutoffs then 
+                bin_range = "&&cutoff&n_cutoffs - &&cutoff&n_cutoffs";
+        run;
+        
+        proc summary data=train&i._binned nway;
+            class bin_range;
+            var target;
+            output out=train&i._stats sum=bad_count mean=bad_rate n=total;
+        run;
+    %end;
+    
+    /* Create reports for testing sets */
+    %do i = 1 %to 6;
+        data test&i._binned;
+            set work.test&i;
+            length bin_range $50;
+            
+            /* Assign bins */
+            %do j = 1 %to %eval(&n_cutoffs-1);
+                %let next = %eval(&j+1);
+                if &&cutoff&j <= pd < &&cutoff&next then 
+                    bin_range = "&&cutoff&j - &&cutoff&next";
+            %end;
+            
+            /* Last bin includes upper bound */
+            if pd >= &&cutoff&n_cutoffs then 
+                bin_range = "&&cutoff&n_cutoffs - &&cutoff&n_cutoffs";
+        run;
+        
+        proc summary data=test&i._binned nway;
+            class bin_range;
+            var target;
+            output out=test&i._stats sum=bad_count mean=bad_rate n=total;
+        run;
+    %end;
+    
+    /* Combine all statistical results */
+    data all_bin_stats;
+        set 
+        %do i = 1 %to 10;
+            train&i._stats(in=tr&i)
+        %end;
+        %do i = 1 %to 6;
+            test&i._stats(in=ts&i)
+        %end;
+        ;
+        
+        length dataset_id $10;
+        
+        /* Assign data set IDs */
+        %do i = 1 %to 10;
+            if tr&i then dataset_id = "Tr&i";
+        %end;
+        %do i = 1 %to 6;
+            if ts&i then dataset_id = "Ts&i";
+        %end;
+        
+        /* Calculate proportion */
+        proportion = total;
+        if dataset_id like 'Tr%' then proportion = proportion / &total_train_pop;
+        else proportion = proportion / &total_test_pop;
+        
+        keep dataset_id bin_range total proportion bad_count bad_rate;
+    run;
+    
+    /* Create summary report */
+    proc tabulate data=all_bin_stats;
+        class dataset_id bin_range;
+        var total proportion bad_rate;
+        table bin_range='Bin Range', 
+              dataset_id='Data Set' * (total='Sample Count' * sum=' ' * f=comma8.
+                                     proportion='Proportion' * mean=' ' * f=percent8.2
+                                     bad_rate='Bad Rate' * mean=' ' * f=percent8.2) / box='Bin Statistics';
+        title 'Bin Statistics Report';
+    run;
+%mend calculate_bin_stats;
+
+/* Execute statistical calculations */
+%calculate_bin_stats;
+
+/* 3. Output final binning report */
+proc print data=work.final_cutoffs;
+    title 'Final Bin Boundaries';
+    format cutoff 8.4;
+run;

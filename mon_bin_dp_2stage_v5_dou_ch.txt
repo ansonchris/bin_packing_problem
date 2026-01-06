@@ -1,0 +1,581 @@
+proc iml;
+    /* ================= 1. 定义全局参数（对应 Python 类初始化）================= */
+    /* 分箱约束参数 */
+    a = 0.05;        /* 单个数据集分箱比例下限 */
+    b = 0.25;        /* 单个数据集分箱比例上限 */
+    C = 0.50;        /* 相邻分箱比例和上限 */
+    eps = 1e-7;      /* 浮点比较精度缓冲 */
+    n_micro = 100;   /* 微分箱数量 */
+    n_train = 10;    /* 训练集数量 */
+    n_test = 6;      /* 测试集数量 */
+    total_train_pop = 0; /* 训练集总样本数 */
+    total_test_pop = 0;  /* 测试集总样本数 */
+
+    /* 数据集名称列表（Tr01-Tr10/Te01-Te06） */
+    train_ds = j(n_train, 1, "");
+    do i = 1 to n_train;
+        train_ds[i] = cats("Tr", put(i, z2.)); /* Tr01~Tr10 */
+    end;
+    test_ds = j(n_test, 1, "");
+    do i = 1 to n_test;
+        test_ds[i] = cats("Te", put(i, z2.)); /* Te01~Te06 */
+    end;
+    all_ds = train_ds // test_ds; /* 合并所有数据集名称 */
+
+    /* ================= 2. 生成模拟数据（对应 Python gen_data）================= */
+    start gen_data(ds_name, n, seed);
+        /* 生成单个数据集：pd（分箱变量）、target（目标变量） */
+        call streaminit(seed);
+        s = rand("integer", 300, 850, n); /* 随机分数 300-850 */
+        pd = 1 / (1 + exp((s - 580) / 50)); /* PD 计算（分数越高，坏率越低） */
+        target = rand("binomial", pd, 1); /* 二项分布生成目标变量 */
+        
+        /* 输出到 SAS 数据集 */
+        create work.(ds_name) var {pd target};
+        append from pd target;
+        close work.(ds_name);
+        
+        /* 返回数据集样本量 */
+        return (nrow(pd));
+    finish gen_data;
+
+    /* 生成 10 个训练集（每个 2000 条）+ 6 个测试集（每个 1000 条） */
+    do i = 1 to n_train;
+        ds_name = train_ds[i];
+        n = 2000;
+        seed = i - 1; /* 种子 0~9 */
+        total_train_pop = total_train_pop + gen_data(ds_name, n, seed);
+    end;
+    do i = 1 to n_test;
+        ds_name = test_ds[i];
+        n = 1000;
+        seed = i + 9; /* 种子 10~15 */
+        total_test_pop = total_test_pop + gen_data(ds_name, n, seed);
+    end;
+
+    print "训练集总样本数：" total_train_pop "测试集总样本数：" total_test_pop;
+
+
+     /* ================= 3. 分箱指标计算模块（核心）================= */
+    /* 输入：low（分箱左边界）、high（分箱右边界）、is_last（是否最后一个分箱） */
+    /* 输出：metrics（指标矩阵）、valid（0=无效，1=有效） */
+    start get_bin_metrics(low, high, is_last, valid);
+        n_ds = nrow(all_ds); /* 总数据集数量（16） */
+        individual_props = j(n_ds, 1, .); /* 单个数据集分箱比例 */
+        counts = j(n_ds, 1, 0);          /* 单个数据集分箱样本数 */
+        bads = j(n_ds, 1, 0);            /* 单个数据集分箱坏样本数 */
+
+        /* 遍历所有数据集，计算基础指标 */
+        do i = 1 to n_ds;
+            ds_name = all_ds[i];
+            /* 读取当前数据集的 PD 和 target，按边界筛选 */
+            use work.(ds_name) var {pd target};
+            if is_last then do;
+                read all where(pd >= low & pd <= high) into tmp; /* 最后一个分箱：[low,high] */
+            end;
+            else do;
+                read all where(pd >= low & pd < high) into tmp;  /* 其他分箱：[low,high) */
+            end;
+            close work.(ds_name);
+
+            /* 计算当前数据集的总样本数 */
+            use work.(ds_name) nobs n;
+            close work.(ds_name);
+
+            /* 填充指标（避免除零） */
+            c = nrow(tmp);
+            b = sum(tmp[, 2]); /* target 在第 2 列 */
+            counts[i] = c;
+            bads[i] = b;
+            if n > 0 then individual_props[i] = c / n;
+            else individual_props[i] = 0;
+        end;
+
+        /* 检查约束 1：所有数据集比例在 [a-eps, b+eps] 内 */
+        if any(individual_props < a - eps) | any(individual_props > b + eps) then do;
+            valid = 0;
+            return (j(1, 6, .)); /* 返回空指标 */
+        end;
+
+        /* 计算聚合统计（训练集：前 10 个；测试集：后 6 个） */
+        train_count = sum(counts[1:n_train]);
+        train_bads = sum(bads[1:n_train]);
+        test_count = sum(counts[n_train+1:n_ds]);
+        test_bads = sum(bads[n_train+1:n_ds]);
+
+        /* 计算坏率（处理除零） */
+        agg_tr_br = ifn(train_count > 0, train_bads / train_count, 0);
+        agg_ts_br = ifn(test_count > 0, test_bads / test_count, 0);
+
+        /* 计算测试集单个坏率及平均值 */
+        test_set_brs = j(n_test, 1, 0);
+        do i = 1 to n_test;
+            idx = n_train + i;
+            if counts[idx] > 0 then test_set_brs[i] = bads[idx] / counts[idx];
+        end;
+        avg_ts_br = mean(test_set_brs);
+
+        /* 计算聚合比例 */
+        agg_tr_prop = train_count / total_train_pop;
+        agg_ts_prop = test_count / total_test_pop;
+
+        /* 输出指标矩阵（列：props(合并)、agg_tr_prop、agg_ts_prop、tr_br、ts_br、avg_ts_br） */
+        metrics = individual_props` || agg_tr_prop || agg_ts_prop || agg_tr_br || agg_ts_br || avg_ts_br;
+        valid = 1;
+        return (metrics);
+    finish get_bin_metrics;
+
+    /* ================= 4. DP 求解模块（Stage 1：全局优化）================= */
+    start solve_stage1(bin_edges, stage1_cuts);
+        /* 步骤 1：生成微分箱边界（对应 Python pd.qcut） */
+        /* 合并所有数据集的 PD 字段，生成 n_micro 个分位数 */
+        use work.(all_ds[1]);
+        read all var {pd} into all_pd;
+        close work.(all_ds[1]);
+        do i = 2 to nrow(all_ds);
+            use work.(all_ds[i]);
+            read all var {pd} into tmp_pd;
+            close work.(all_ds[i]);
+            all_pd = all_pd // tmp_pd;
+        end;
+
+        /* 用分位数生成微分箱边界（去重+排序） */
+        call qntl(bin_edges, all_pd, (1:n_micro)/(n_micro+1)); /* 分位数点 */
+        bin_edges = unique(bin_edges); /* 去重 */
+        call sort(bin_edges); /* 排序 */
+        bin_edges = bin_edges`; /* 转为列向量 */
+        n_edges = nrow(bin_edges); /* 边界数量 */
+        n_micro_bins = n_edges - 1; /* 微分箱数量 */
+        print "微分箱边界数量：" n_edges "微分箱数量：" n_micro_bins;
+
+        /* 步骤 2：初始化 DP 状态链（替代 Python 字典 chains，用数据集存储） */
+        create work.chain var {start end len prev_start prev_end};
+        append from j(1, 5, .) / nosymbols; /* 占位行，后续删除 */
+        close work.chain;
+
+        /* 步骤 3：双重循环遍历所有微分箱，构建状态链 */
+        do j = 2 to n_edges; /* 终点 j（1 基，对应 Python j+1） */
+            high = bin_edges[j];
+            do i = 1 to j - 1; /* 起点 i（1 基，对应 Python i） */
+                low = bin_edges[i];
+                is_last = ifn(j = n_edges, 1, 0);
+                valid = 0;
+
+                /* 计算当前分箱指标 */
+                metrics = get_bin_metrics(low, high, is_last, valid);
+                if valid = 0 then continue; /* 不满足约束，跳过 */
+
+                /* 情况 1：i=1（起点为第一个边界），路径长度=1 */
+                if i = 1 then do;
+                    start_idx = i;
+                    end_idx = j;
+                    len = 1;
+                    prev_start = .;
+                    prev_end = .;
+                    create work.tmp_chain var {start_idx end_idx len prev_start prev_end};
+                    append from start_idx end_idx len prev_start prev_end;
+                    close work.tmp_chain;
+                    proc append base=work.chain data=work.tmp_chain force;
+                    run;
+                    continue;
+                end;
+
+                /* 情况 2：i>1，查找前驱状态（终点=当前 i） */
+                use work.chain where(end = i);
+                read all var {start end len} into prev_states;
+                close work.chain;
+                if nrow(prev_states) = 0 then continue;
+
+                /* 遍历前驱，检查单调性和相邻比例和约束 */
+                best_len = -1;
+                best_prev_start = .;
+                best_prev_end = .;
+                do p = 1 to nrow(prev_states);
+                    prev_start = prev_states[p, 1];
+                    prev_end = prev_states[p, 2];
+                    prev_len = prev_states[p, 3];
+
+                    /* 读取前驱分箱指标 */
+                    prev_low = bin_edges[prev_start];
+                    prev_high = bin_edges[prev_end];
+                    prev_metrics = get_bin_metrics(prev_low, prev_high, 0, valid);
+                    if valid = 0 then continue;
+
+                    /* 提取当前和前驱的关键指标 */
+                    curr_tr_br = metrics[1, 4];  /* tr_br 在第 4 列 */
+                    curr_ts_br = metrics[1, 5];  /* ts_br 在第 5 列 */
+                    curr_avg_br = metrics[1, 6]; /* avg_ts_br 在第 6 列 */
+                    prev_tr_br = prev_metrics[1, 4];
+                    prev_ts_br = prev_metrics[1, 5];
+                    prev_avg_br = prev_metrics[1, 6];
+                    curr_props = metrics[1, 1:nrow(all_ds)]; /* props 在第 1~16 列 */
+                    prev_props = prev_metrics[1, 1:nrow(all_ds)];
+
+                    /* 检查单调性（当前 ≥ 前驱，允许 eps 误差） */
+                    mono_ok = (curr_tr_br >= prev_tr_br - eps) & 
+                              (curr_ts_br >= prev_ts_br - eps) & 
+                              (curr_avg_br >= prev_avg_br - eps);
+                    /* 检查相邻比例和（≤ C+eps） */
+                    sum_props = prev_props + curr_props;
+                    adj_ok = all(sum_props <= C + eps);
+
+                    /* 更新最优前驱 */
+                    if mono_ok & adj_ok & prev_len > best_len then do;
+                        best_len = prev_len;
+                        best_prev_start = prev_start;
+                        best_prev_end = prev_end;
+                    end;
+                end;
+
+                /* 保存最优状态 */
+                if best_len > 0 then do;
+                    start_idx = i;
+                    end_idx = j;
+                    len = best_len + 1;
+                    prev_start = best_prev_start;
+                    prev_end = best_prev_end;
+                    create work.tmp_chain var {start_idx end_idx len prev_start prev_end};
+                    append from start_idx end_idx len prev_start prev_end;
+                    close work.tmp_chain;
+                    proc append base=work.chain data=work.tmp_chain force;
+                    run;
+                end;
+            end;
+        end;
+
+        /* 步骤 4：回溯最优路径（终点为最后一个边界，长度最大） */
+        use work.chain where(end = n_edges) order by len desc;
+        read all var {start end} into final_state;
+        close work.chain;
+        if nrow(final_state) = 0 then do;
+            stage1_cuts = j(1, 0, .); /* 无有效路径 */
+            return;
+        end;
+
+        /* 回溯路径 */
+        curr_start = final_state[1, 1];
+        curr_end = final_state[1, 2];
+        path = j(1, 2, .);
+        path[1, 1] = curr_start;
+        path[1, 2] = curr_end;
+
+        do while(curr_start ^= .);
+            use work.chain where(start = curr_start & end = curr_end);
+            read all var {prev_start prev_end} into prev;
+            close work.chain;
+            if nrow(prev) = 0 then leave;
+            curr_start = prev[1, 1];
+            curr_end = prev[1, 2];
+            if curr_start ^= . then path = path // (curr_start || curr_end);
+        end;
+
+        /* 生成 Stage1 分箱边界（按顺序排列） */
+        stage1_cuts = bin_edges[path[nrow(path), 1]]; /* 第一个边界 */
+        do i = nrow(path) downto 1;
+            stage1_cuts = stage1_cuts || bin_edges[path[i, 2]]; /* 后续边界 */
+        end;
+        stage1_cuts = unique(stage1_cuts); /* 去重 */
+        print "Stage1 分箱边界数量：" nrow(stage1_cuts);
+        print "Stage1 分箱边界：" stage1_cuts;
+    finish solve_stage1;
+
+    /* 调用 DP 求解模块 */
+    declare double bin_edges[] stage1_cuts[];
+    call solve_stage1(bin_edges, stage1_cuts);
+    /* ================= 5. 递归修复模块（Stage 2：迭代模拟递归）================= */
+    start repair_recursive(init_cuts, final_cuts);
+        max_iter = 100; /* 最大迭代次数（避免死循环） */
+        curr_iter = 0;
+        curr_cuts = init_cuts;
+        final_cuts = init_cuts;
+
+        do while(curr_iter < max_iter);
+            /* 步骤 1：检查当前分箱是否有违规 */
+            n_cuts = ncol(curr_cuts);
+            n_bins = n_cuts - 1;
+            violation_idx = .; /* 违规分箱索引（1 基） */
+            stats = j(n_bins, 6 + nrow(all_ds), .); /* 存储每个分箱的指标 */
+
+            /* 计算每个分箱的指标 */
+            do bin = 1 to n_bins;
+                low = curr_cuts[bin];
+                high = curr_cuts[bin + 1];
+                is_last = ifn(bin = n_bins, 1, 0);
+                valid = 0;
+                metrics = get_bin_metrics(low, high, is_last, valid);
+                if valid = 0 then do;
+                    violation_idx = bin;
+                    leave;
+                end;
+                stats[bin, ] = metrics; /* 保存指标 */
+            end;
+
+            /* 无违规，直接返回当前分箱 */
+            if violation_idx = . then do;
+                final_cuts = curr_cuts;
+                break;
+            end;
+
+            /* 步骤 2：生成三种合并策略 */
+            cuts_L = j(1, 0, .); /* Path L：合并 violation_idx 与左邻 */
+            cuts_R = j(1, 0, .); /* Path R：合并 violation_idx 与右邻 */
+            cuts_LL = j(1, 0, .);/* Path LL：合并 violation_idx-2 与 violation_idx-1 */
+
+            /* 策略 L：删除 violation_idx 位置的边界（保留 1~violation_idx-1, violation_idx+1~n_cuts） */
+            do i = 1 to n_cuts;
+                if i ^= violation_idx then cuts_L = cuts_L || curr_cuts[i];
+            end;
+
+            /* 策略 R：删除 violation_idx+1 位置的边界（需满足 violation_idx < n_cuts-1） */
+            if violation_idx < n_cuts - 1 then do;
+                do i = 1 to n_cuts;
+                    if i ^= violation_idx + 1 then cuts_R = cuts_R || curr_cuts[i];
+                end;
+            end;
+
+            /* 策略 LL：删除 violation_idx-1 位置的边界（需满足 violation_idx ≥2） */
+            if violation_idx >= 2 then do;
+                do i = 1 to n_cuts;
+                    if i ^= violation_idx - 1 then cuts_LL = cuts_LL || curr_cuts[i];
+                end;
+            end;
+
+            /* 步骤 3：评估所有有效策略，选择分箱数最多的 */
+            candidates = j(1, 0, .);
+            if ncol(cuts_L) > 1 then candidates = candidates || cuts_L;
+            if ncol(cuts_R) > 1 then candidates = candidates || cuts_R;
+            if ncol(cuts_LL) > 1 then candidates = candidates || cuts_LL;
+            if ncol(candidates) = 0 then do;
+                final_cuts = j(1, 0, .); /* 无有效策略 */
+                return;
+            end;
+
+            /* 选择分箱数最多的候选 */
+            max_bins = -1;
+            next_cuts = j(1, 0, .);
+            do c = 1 to ncol(candidates) by n_cuts - 1; /* 按策略分组（每组长度为分箱边界数） */
+                cut_group = candidates[c:(c + ncol(cuts_L) - 1)];
+                n_bins_curr = ncol(cut_group) - 1;
+                if n_bins_curr > max_bins then do;
+                    max_bins = n_bins_curr;
+                    next_cuts = cut_group;
+                end;
+            end;
+
+            curr_cuts = next_cuts;
+            curr_iter = curr_iter + 1;
+        end;
+
+        final_cuts = curr_cuts;
+        print "修复后最终分箱边界数量：" ncol(final_cuts);
+        print "修复后最终分箱边界：" final_cuts;
+    finish repair_recursive;
+
+    /* 调用递归修复模块 */
+    declare double final_cuts[];
+    if ncol(stage1_cuts) > 0 then do;
+        call repair_recursive(stage1_cuts, final_cuts);
+    end;
+    else do;
+        final_cuts = j(1, 0, .);
+        print "ERROR: Stage1 无有效分箱路径，修复终止";
+    end;
+
+    /* ================= 6. 最终报告输出（对应 Python final_report）================= */
+    start final_report(cuts);
+        n_cuts = ncol(cuts);
+        if n_cuts < 2 then do;
+            print "ERROR: 无有效分箱边界，无法生成报告";
+            return;
+        end;
+        n_bins = n_cuts - 1;
+
+        print "=" repeat("-", 98) "=";
+        print "FINAL BINNING AUDIT REPORT";
+        print "=" repeat("-", 98) "=";
+
+        do bin = 1 to n_bins;
+            low = cuts[bin];
+            high = cuts[bin + 1];
+            is_last = ifn(bin = n_bins, 1, 0);
+            valid = 0;
+            metrics = get_bin_metrics(low, high, is_last, valid);
+
+            /* 提取指标 */
+            agg_tr_prop = metrics[1, 2]; /* 第 2 列：agg_tr_prop */
+            agg_ts_prop = metrics[1, 3]; /* 第 3 列：agg_ts_prop */
+            tr_br = metrics[1, 4];       /* 第 4 列：tr_br */
+            ts_br = metrics[1, 5];       /* 第 5 列：ts_br */
+            avg_ts_br = metrics[1, 6];   /* 第 6 列：avg_ts_br */
+
+            /* 打印分箱信息 */
+            print "BIN " bin ": Range [" low ":0.2f, " high ":0.2f]";
+            print "  - AGGREGATE PROPORTION:  Train: " agg_tr_prop ":0.2% | Test: " agg_ts_prop ":0.2%";
+            print "  - BAD RATES:            Train: " tr_br ":0.4f | Test: " ts_br ":0.4f | AvgTest: " avg_ts_br ":0.4f";
+
+            /* 单调性检查（非第一个分箱） */
+            if bin > 1 then do;
+                prev_low = cuts[bin - 1];
+                prev_high = cuts[bin];
+                prev_metrics = get_bin_metrics(prev_low, prev_high, 0, valid);
+                prev_tr_br = prev_metrics[1, 4];
+                prev_ts_br = prev_metrics[1, 5];
+                prev_avg_br = prev_metrics[1, 6];
+                mono_ok = (tr_br > prev_tr_br) & (ts_br > prev_ts_br) & (avg_ts_br > prev_avg_br);
+                print "  - MONOTONICITY CHECK:   " ifn(mono_ok, "PASS", "FAIL !!");
+            end;
+            print repeat("-", 100);
+        end;
+    finish final_report;
+
+    /* 调用最终报告模块 */
+    if ncol(final_cuts) >= 2 then call final_report(final_cuts);
+
+    /* ================= 7. 分箱验证（对应 Python calculate_bin_metrics_to_df）================= */
+    start calculate_bin_metrics_to_df(cuts);
+        n_cuts = ncol(cuts);
+        n_bins = n_cuts - 1;
+        if n_bins < 1 then return;
+
+        /* 步骤 1：生成分箱标签 */
+        bin_labels = j(n_bins, 1, "");
+        do i = 1 to n_bins;
+            low = cuts[i];
+            high = cuts[i + 1];
+            if i = n_bins then bin_labels[i] = cats("[", low:0.2f, ", ", high:0.2f, "]");
+            else bin_labels[i] = cats("[", low:0.2f, ", ", high:0.2f, ")");
+        end;
+
+        /* 步骤 2：单个训练集统计（df_single_train） */
+        create work.single_train var {dataset_id bin_interval customer_count percentage total_dataset_customers};
+        do i = 1 to n_train;
+            ds_name = train_ds[i];
+            dataset_id = cats("Tr", put(i, z2.));
+            /* 读取数据集总样本数 */
+            use work.(ds_name) nobs total_cnt;
+            close work.(ds_name);
+            /* 统计每个分箱的样本数 */
+            bin_count = j(n_bins, 1, 0);
+            do bin = 1 to n_bins;
+                low = cuts[bin];
+                high = cuts[bin + 1];
+                is_last = ifn(bin = n_bins, 1, 0);
+                use work.(ds_name) where(pd >= low & (pd <= high & is_last | pd < high & ~is_last));
+                read all var {pd} into tmp;
+                close work.(ds_name);
+                bin_count[bin] = nrow(tmp);
+            end;
+            /* 填充结果 */
+            do bin = 1 to n_bins;
+                bin_interval = bin_labels[bin];
+                customer_count = bin_count[bin];
+                percentage = round(customer_count / total_cnt * 100, 0.02);
+                append from dataset_id bin_interval customer_count percentage total_cnt;
+            end;
+        end;
+        close work.single_train;
+
+        /* 步骤 3：单个测试集统计（df_single_val） */
+        create work.single_val var {dataset_id bin_interval customer_count percentage total_dataset_customers};
+        do i = 1 to n_test;
+            ds_name = test_ds[i];
+            dataset_id = cats("Te", put(i, z2.));
+            use work.(ds_name) nobs total_cnt;
+            close work.(ds_name);
+            bin_count = j(n_bins, 1, 0);
+            do bin = 1 to n_bins;
+                low = cuts[bin];
+                high = cuts[bin + 1];
+                is_last = ifn(bin = n_bins, 1, 0);
+                use work.(ds_name) where(pd >= low & (pd <= high & is_last | pd < high & ~is_last));
+                read all var {pd} into tmp;
+                close work.(ds_name);
+                bin_count[bin] = nrow(tmp);
+            end;
+            do bin = 1 to n_bins;
+                bin_interval = bin_labels[bin];
+                customer_count = bin_count[bin];
+                percentage = round(customer_count / total_cnt * 100, 0.02);
+                append from dataset_id bin_interval customer_count percentage total_cnt;
+            end;
+        end;
+        close work.single_val;
+
+        /* 步骤 4：合并训练集统计（df_merge_train） */
+        /* 合并所有训练集 */
+        use work.(train_ds[1]);
+        read all var {pd target} into train_merged;
+        close work.(train_ds[1]);
+        do i = 2 to n_train;
+            use work.(train_ds[i]);
+            read all var {pd target} into tmp;
+            close work.(train_ds[i]);
+            train_merged = train_merged // tmp;
+        end;
+        /* 分箱并统计 */
+        bin = j(nrow(train_merged), 1, .);
+        do i = 1 to n_bins;
+            low = cuts[i];
+            high = cuts[i + 1];
+            is_last = ifn(i = n_bins, 1, 0);
+            idx = loc(train_merged[, 1] >= low & (train_merged[, 1] <= high & is_last | train_merged[, 1] < high & ~is_last));
+            bin[idx] = i;
+        end;
+        /* 分组统计 */
+        create work.merge_train var {bin_interval total_customers bad_sample_count bad_sample_rate total_merged_customers total_merged_bad_samples};
+        total_merged_cnt = nrow(train_merged);
+        total_merged_bad = sum(train_merged[, 2]);
+        do i = 1 to n_bins;
+            idx = loc(bin = i);
+            total_customers = nrow(idx);
+            bad_sample_count = sum(train_merged[idx, 2]);
+            bad_sample_rate = round(bad_sample_count / total_customers * 100, 0.02);
+            bin_interval = bin_labels[i];
+            append from bin_interval total_customers bad_sample_count bad_sample_rate total_merged_cnt total_merged_bad;
+        end;
+        close work.merge_train;
+
+        /* 步骤 5：合并测试集统计（df_merge_val） */
+        use work.(test_ds[1]);
+        read all var {pd target} into val_merged;
+        close work.(test_ds[1]);
+        do i = 2 to n_test;
+            use work.(test_ds[i]);
+            read all var {pd target} into tmp;
+            close work.(test_ds[i]);
+            val_merged = val_merged // tmp;
+        end;
+        bin = j(nrow(val_merged), 1, .);
+        do i = 1 to n_bins;
+            low = cuts[i];
+            high = cuts[i + 1];
+            is_last = ifn(i = n_bins, 1, 0);
+            idx = loc(val_merged[, 1] >= low & (val_merged[, 1] <= high & is_last | val_merged[, 1] < high & ~is_last));
+            bin[idx] = i;
+        end;
+        create work.merge_val var {bin_interval total_customers bad_sample_count bad_sample_rate total_merged_customers total_merged_bad_samples};
+        total_merged_cnt = nrow(val_merged);
+        total_merged_bad = sum(val_merged[, 2]);
+        do i = 1 to n_bins;
+            idx = loc(bin = i);
+            total_customers = nrow(idx);
+            bad_sample_count = sum(val_merged[idx, 2]);
+            bad_sample_rate = round(bad_sample_count / total_customers * 100, 0.02);
+            bin_interval = bin_labels[i];
+            append from bin_interval total_customers bad_sample_count bad_sample_rate total_merged_cnt total_merged_bad;
+        end;
+        close work.merge_val;
+
+        print "分箱验证数据集生成完成：";
+        print "  - 单个训练集：work.single_train";
+        print "  - 单个测试集：work.single_val";
+        print "  - 合并训练集：work.merge_train";
+        print "  - 合并测试集：work.merge_val";
+    finish calculate_bin_metrics_to_df;
+
+    /* 调用分箱验证模块 */
+    if ncol(final_cuts) >= 2 then call calculate_bin_metrics_to_df(final_cuts);
+
+quit;
+
+
