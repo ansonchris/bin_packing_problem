@@ -1,0 +1,170 @@
+/* 创建原始数据集 - 使用SAS日期格式 */
+data origin_data;
+    format d_snapshot date9.;  /* 设置日期格式 */
+    input d_snapshot :date9. target pd;
+    datalines;
+30JUN2014 1 7
+30JUN2015 2 6
+30JUN2016 3 5
+30JUN2017 4 4
+30JUN2018 5 3
+30JUN2019 6 2
+30JUN2020 7 1
+;
+run;
+
+/* 定义训练日期和测试日期 - 使用SAS日期常量 */
+%let train_dates = '30JUN2014'd '30JUN2015'd; 
+%let test_dates = '30JUN2018'd '30JUN2019'd;
+
+/* 方法1: 使用宏和proc append */
+/* 初始化空数据集 */
+data all_data;
+    length dataset_id $5;
+    set origin_data(obs=0); /* 仅复制结构 */
+    format dataset_id $5. is_train ds_idx 8.;
+    dataset_id = "";
+    is_train = .;
+    ds_idx = .;
+run;
+
+/* 处理训练数据集 */
+%macro process_train_dates;
+    %let i = 1;
+    %do %while (%scan(&train_dates, &i, ' ') ne );
+        %let current_date = %scan(&train_dates, &i, ' ');
+        
+        data temp;
+            set origin_data;
+            where d_snapshot = &current_date;
+            dataset_id = "Tr&i";
+            is_train = 1;
+            ds_idx = &i;
+        run;
+        
+        /* 追加到all_data */
+        proc append base=all_data data=temp force;
+        run;
+        
+        %let i = %eval(&i + 1);
+    %end;
+%mend process_train_dates;
+
+/* 处理测试数据集 */
+%macro process_test_dates;
+    %let i = 1;
+    %do %while (%scan(&test_dates, &i, ' ') ne );
+        %let current_date = %scan(&test_dates, &i, ' ');
+        
+        data temp;
+            set origin_data;
+            where d_snapshot = &current_date;
+            dataset_id = "Ts&i";
+            is_train = 0;
+            ds_idx = &i + 10; /* 测试集索引从11开始 */
+        run;
+        
+        /* 追加到all_data */
+        proc append base=all_data data=temp force;
+        run;
+        
+        %let i = %eval(&i + 1);
+    %end;
+%mend process_test_dates;
+
+/* 执行处理 */
+%process_train_dates;
+%process_test_dates;
+
+/* 查看生成的数据 */
+proc print data=all_data;
+    format d_snapshot date9.;  /* 确保日期格式正确显示 */
+    title "Generated all_data Dataset (Method 1)";
+run;
+
+/* 方法2: 使用SQL连接（更简洁） */
+/* 创建日期查找表 - 使用SAS日期值 */
+data date_lookup;
+    length dataset_id $5;
+    format d_snapshot date9.;
+    input d_snapshot :date9. dataset_id $ is_train ds_idx;
+    datalines;
+30JUN2014 Tr1 1 1
+30JUN2015 Tr2 1 2
+30JUN2018 Ts1 0 11
+30JUN2019 Ts2 0 12
+;
+run;
+
+/* 合并创建all_data_sql */
+proc sql;
+    create table all_data_sql as
+    select 
+        o.d_snapshot,
+        o.target,
+        o.pd,
+        d.dataset_id,
+        d.is_train,
+        d.ds_idx
+    from origin_data o
+    left join date_lookup d
+        on o.d_snapshot = d.d_snapshot
+    where d.d_snapshot is not null  /* 只保留有匹配的日期 */
+    order by ds_idx;
+quit;
+
+/* 查看结果 */
+proc print data=all_data_sql;
+    format d_snapshot date9.;
+    title "Generated all_data Dataset (Method 2 - SQL)";
+run;
+
+/* 方法3: 使用数据步和数组 */
+data all_data_array;
+    set origin_data;
+    length dataset_id $5;
+    
+    /* 训练日期数组 - 使用SAS日期值 */
+    array train_dates[2] _temporary_ ('30JUN2014'd, '30JUN2015'd);
+    /* 测试日期数组 - 使用SAS日期值 */
+    array test_dates[2] _temporary_ ('30JUN2018'd, '30JUN2019'd);
+    
+    /* 检查是否为训练日期 */
+    do i = 1 to dim(train_dates);
+        if d_snapshot = train_dates[i] then do;
+            dataset_id = cats('Tr', i);
+            is_train = 1;
+            ds_idx = i;
+            output;
+            return;
+        end;
+    end;
+    
+    /* 检查是否为测试日期 */
+    do i = 1 to dim(test_dates);
+        if d_snapshot = test_dates[i] then do;
+            dataset_id = cats('Ts', i);
+            is_train = 0;
+            ds_idx = i + 10; /* 测试集索引从11开始 */
+            output;
+            return;
+        end;
+    end;
+    
+    drop i;
+run;
+
+/* 查看结果 */
+proc print data=all_data_array;
+    format d_snapshot date9.;
+    title "Generated all_data Dataset (Method 3 - Array)";
+run;
+
+/* 比较三种方法的结果 */
+proc compare base=all_data compare=all_data_sql;
+    title "Compare Method 1 and Method 2";
+run;
+
+proc compare base=all_data compare=all_data_array;
+    title "Compare Method 1 and Method 3";
+run;
