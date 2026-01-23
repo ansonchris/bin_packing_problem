@@ -1,0 +1,25 @@
+# Excel File Function Description & Output Specifications
+This Excel file focuses on model analysis and result presentation, covering three core functional modules: Logistic Regression Result Analysis & Output, Portfolio Analysis, and Parameter Sensitivity Analysis. The detailed content and output specifications are as follows:
+
+## 1. Logistic Regression Result Analysis & Output
+This module outputs multi-dimensional analytical data based on logistic regression model results, including the following sub-items:
+1. Model Summary: Presents the overall overview of the logistic regression model;
+2. Logistic Regression Coefficient Display: Clearly lists the regression coefficients of each variable in the model;
+3. Model AR and APPO Results: Outputs the model's AR (Accuracy Ratio) and APPO (specific evaluation indicator) results;
+4. Change Analysis: Conducts a special analysis on the changes of key model indicators;
+5. Score Interval Distribution: For the model's training data and test data (if available), split the score intervals by two methods—"equal sample division" and "equal bad sample size division"—and output the relevant statistics for each interval;
+6. Score Histogram Distribution: Counts the count and proportion of each score in the model's training data and test data (if available) to form distribution data;
+7. Correlation Matrix: Calculate the Pearson correlation coefficient for each pair of variables in the regression sample to construct a correlation matrix.
+
+## 2.1 Portfolio Analysis
+Based on the predefined score intervals, two core calculations are performed:
+1. The mean of the original values of the modeled data;
+2. The proportion of valid data for each modeled variable.
+
+## 2.3 Parameter Sensitivity Analysis
+1. Basic Data Calculation: First, calculate the minimum value, maximum value, and corresponding values of the 10th-90th percentiles for all modeled variables;
+2. Default Rate Prediction Calculation: For each modeled variable, while keeping the values of all other variables unchanged, replace the value of this variable with the aforementioned minimum value, maximum value, and 10th-90th percentile values respectively, and then calculate the average default rate predicted by the model.
+
+## 3. Variable Description
+1. Input Variables: Not specifically specified;
+2. Output Variables: Corresponding Excel-formatted analytical results (including all calculation data and statistical results of the above three modules).
