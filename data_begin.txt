@@ -1,0 +1,81 @@
+/* 1. 读取原始 SAS 数据集 & 预处理字段 */
+data raw;
+    set "data.sas7bdat" /* 替换为你的实际文件路径 */;
+    encoding='latin-1'; /* 若编码有问题，可在 set 前加 infile 语句指定 encoding */
+    
+    /* 等价于 df['pd'] = df['initial_pd'] * 10000 */
+    length pd 8;
+    pd = initial_pd * 10000;
+    
+    /* 等价于 df['target'] = df['ab_perf_bad_n12m'] */
+    length target 8;
+    target = ab_perf_bad_n12m;
+    
+    /* 只保留需要的字段 */
+    keep pd target d_snapshot;
+run;
+
+/* 2. 定义训练/测试快照列表 */
+%let train_snap = '2014-06-30','2015-06-30','2016-06-30','2017-06-30','2018-06-30',
+                  '2019-06-30','2020-06-30','2021-06-30','2022-06-30','2023-06-30';
+%let test_snap  = '2018-06-30','2019-06-30','2020-06-30','2021-06-30','2022-06-30','2023-06-30';
+
+/* 3. 生成训练集 df_train */
+data df_train;
+    set raw;
+    where d_snapshot in (&train_snap.);
+    
+    length dataset_id $8;
+    length is_train 3;
+    length ds_idx 8;
+    
+    /* 按快照顺序分配 ds_idx (从1开始) */
+    select(d_snapshot);
+        when('2014-06-30') do; ds_idx = 1; dataset_id = "Tr1"; end;
+        when('2015-06-30') do; ds_idx = 2; dataset_id = "Tr2"; end;
+        when('2016-06-30') do; ds_idx = 3; dataset_id = "Tr3"; end;
+        when('2017-06-30') do; ds_idx = 4; dataset_id = "Tr4"; end;
+        when('2018-06-30') do; ds_idx = 5; dataset_id = "Tr5"; end;
+        when('2019-06-30') do; ds_idx = 6; dataset_id = "Tr6"; end;
+        when('2020-06-30') do; ds_idx = 7; dataset_id = "Tr7"; end;
+        when('2021-06-30') do; ds_idx = 8; dataset_id = "Tr8"; end;
+        when('2022-06-30') do; ds_idx = 9; dataset_id = "Tr9"; end;
+        when('2023-06-30') do; ds_idx = 10; dataset_id = "Tr10"; end;
+        otherwise;
+    end;
+    
+    is_train = 1;
+    drop d_snapshot;
+run;
+
+/* 4. 生成测试集 df_test */
+data df_test;
+    set raw;
+    where d_snapshot in (&test_snap.);
+    
+    length dataset_id $8;
+    length is_train 3;
+    length ds_idx 8;
+    
+    /* 测试集 ds_idx 从 11 开始（因为训练集有10个） */
+    select(d_snapshot);
+        when('2018-06-30') do; ds_idx = 11; dataset_id = "Ts1"; end;
+        when('2019-06-30') do; ds_idx = 12; dataset_id = "Ts2"; end;
+        when('2020-06-30') do; ds_idx = 13; dataset_id = "Ts3"; end;
+        when('2021-06-30') do; ds_idx = 14; dataset_id = "Ts4"; end;
+        when('2022-06-30') do; ds_idx = 15; dataset_id = "Ts5"; end;
+        when('2023-06-30') do; ds_idx = 16; dataset_id = "Ts6"; end;
+        otherwise;
+    end;
+    
+    is_train = 0;
+    drop d_snapshot;
+run;
+
+/* 5. 拼接训练集 + 测试集（等价于 pd.concat） */
+data all_data;
+    set df_train df_test;
+run;
+
+/* 可选：查看结果 */
+proc print data=all_data(obs=10); run;
