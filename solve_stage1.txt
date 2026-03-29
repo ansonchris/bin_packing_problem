@@ -1,0 +1,156 @@
+    start solve_stage1(n_micro=100) global(
+        all_data, a, b, C, eps, n_train, n_test
+    );
+        print "Stage 1: Running Dynamic Programming Solver...";
+        print "It may take a while, plz wait.";
+
+        /* --------------------------
+           1. 生成初始微箱切点（对应 Python qcut）
+           -------------------------- */
+        pd_col = all_data[,1];
+        call qcut(pd_col, q=n_micro, bins=bin_edges);
+        /* 去重 + 排序 */
+        bin_edges = unique(bin_edges);
+        call sort(bin_edges);
+        n = ncol(bin_edges) - 1;  /* 微箱数 */
+        print "初始微箱切点：" bin_edges;
+
+        /* --------------------------
+           2. 动态规划状态初始化
+           -------------------------- */
+        declare hash chains();
+        chains.definekey("i", "j");
+        chains.definedata("best_len", "best_pred");
+        chains.definedone();
+
+        do j = 2 to n+1;  /* IML 下标从1开始，对应 Python j=1..n */
+            do i = 1 to j-1;
+                low = bin_edges[i];
+                high = bin_edges[j];
+                is_last = (j = n+1);
+
+                /* 计算当前区间指标 */
+                curr = get_bin_metrics(low, high, is_last);
+                if type(curr) = "N" & curr = . then do;
+                    continue;  /* 违规区间跳过 */
+                end;
+
+                /* 处理起点：i=1（对应 Python i=0） */
+                if i = 1 then do;
+                    best_len = 1;
+                    best_pred = .;
+                    chains.replace(key: i, data: best_len, best_pred);
+                    continue;
+                end;
+
+                /* --------------------------
+                   3. 遍历前驱，更新DP状态
+                   -------------------------- */
+                best_len = -1;
+                best_pred = .;
+
+                /* 遍历所有右切点 = i 的状态（即前驱的右边界是当前左边界） */
+                declare iter iter(chains);
+                rc = iter.first();
+                do while(rc = 0);
+                    pk = iter.getkey("i");
+                    pi = iter.getkey("j");
+                    if pi ^= i then do;
+                        rc = iter.next();
+                        continue;
+                    end;
+
+                    /* 计算前驱区间指标 */
+                    prev_low = bin_edges[pk];
+                    prev_high = bin_edges[pi];
+                    prev = get_bin_metrics(prev_low, prev_high, 0);
+                    if type(prev) = "N" & prev = . then do;
+                        rc = iter.next();
+                        continue;
+                    end;
+
+                    /* 单调性校验 */
+                    curr_tr = curr[1]; curr_ts = curr[2]; curr_avg_ts = curr[3];
+                    prev_tr = prev[1]; prev_ts = prev[2]; prev_avg_ts = prev[3];
+                    if curr_tr <= prev_tr - eps | curr_ts <= prev_ts - eps | curr_avg_ts <= prev_avg_ts - eps then do;
+                        rc = iter.next();
+                        continue;
+                    end;
+
+                    /* 相邻占比和校验 */
+                    curr_props = curr[4:ncol(curr)];
+                    prev_props = prev[4:ncol(prev)];
+                    if any(prev_props + curr_props > C + eps) then do;
+                        rc = iter.next();
+                        continue;
+                    end;
+
+                    /* 更新最优前驱 */
+                    call chains.find(key: pk, key: pi);
+                    if best_len < best_len then do;
+                        best_len = best_len;
+                        best_pred = pk || pi;
+                    end;
+                    rc = iter.next();
+                end;
+
+                /* 记录当前状态 */
+                if best_pred ^= . then do;
+                    chains.replace(key: i, key: j, data: best_len+1, best_pred);
+                end;
+            end;
+        end;
+
+        /* --------------------------
+           4. 回溯最优路径
+           -------------------------- */
+        /* 找到终点：j = n+1（最后一个切点）且最长的状态 */
+        max_len = -1;
+        final_i = .; final_j = .;
+        declare iter iter2(chains);
+        rc = iter2.first();
+        do while(rc = 0);
+            i = iter2.getkey("i");
+            j = iter2.getkey("j");
+            if j ^= n+1 then do;
+                rc = iter2.next();
+                continue;
+            end;
+            call chains.find(key: i, key: j);
+            if best_len > max_len then do;
+                max_len = best_len;
+                final_i = i;
+                final_j = j;
+            end;
+            rc = iter2.next();
+        end;
+
+        if max_len = -1 then do;
+            print "No valid binning found!";
+            return([]);
+        end;
+
+        /* 回溯路径 */
+        path = [];
+        curr_i = final_i;
+        curr_j = final_j;
+        do while(curr_j ^= .);
+            path = path || curr_j;
+            call chains.find(key: curr_i, key: curr_j);
+            if best_pred = . then do;
+                break;
+            end;
+            curr_i = best_pred[1];
+            curr_j = best_pred[2];
+        end;
+
+        /* 反转路径，输出最终切点 */
+        call reverse(path);
+        final_cuts = bin_edges[1] || bin_edges[path];
+        print "最终分箱切点：" final_cuts;
+        return(final_cuts);
+    finish;
+
+    /* 运行求解 */
+    final_cuts = solve_stage1(n_micro);
+quit;
