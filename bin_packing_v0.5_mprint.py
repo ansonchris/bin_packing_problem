@@ -467,3 +467,125 @@ df_single_train, df_single_val, df_merge_train, df_merge_val = calculate_bin_met
     final_cuts, train_sets, test_sets, enable_mprint=True
 )
 #%%
+
+import pandas as pd
+import numpy as np
+
+class MPrint:
+    """模拟SAS MPRINT功能：打印执行过程中的关键代码/步骤（支持日志文件写入）"""
+    def __init__(self, enable=True, prefix="MPRINT", log_file=None):
+        self.enable = enable  # 是否开启MPRINT
+        self.prefix = prefix  # 输出前缀，模拟SAS MPRINT前缀
+        self.log_file = log_file  # 日志文件路径
+        self.log_handle = None
+        
+        # 初始化日志文件句柄（追加模式，UTF-8编码）
+        if self.log_file and self.enable:
+            self.log_handle = open(self.log_file, 'a', encoding='utf-8')
+
+    def print(self, content):
+        """打印MPRINT内容（控制台+日志文件）"""
+        if self.enable:
+            # 格式化输出内容
+            log_content = f"{self.prefix}: {content}"
+            # 输出到控制台
+            print(log_content)
+            # 写入日志文件
+            if self.log_handle:
+                self.log_handle.write(f"{log_content}\n")
+                self.log_handle.flush()  # 立即刷新，避免内容缓存
+
+    def close(self):
+        """关闭日志文件句柄（关键：防止文件句柄泄漏）"""
+        if self.log_handle:
+            self.log_handle.close()
+            self.log_handle = None
+
+class AdvancedBinningFramework:
+    def __init__(self, train_dfs, test_dfs, a=0.05, b=0.25, C=0.50, enable_mprint=True, log_file=None):
+        self.train_dfs = train_dfs
+        self.test_dfs = test_dfs
+        self.all_dfs = train_dfs + test_dfs
+        self.n_train, self.n_test = len(train_dfs), len(test_dfs)
+        
+        # Constraints
+        self.a, self.b, self.C = a, b, C
+        self.eps = 1e-7  # Precision buffer for floating point comparisons
+        
+        # Pre-calculate total populations for aggregate proportion calculation
+        self.total_train_pop = sum(len(df) for df in train_dfs)
+        self.total_test_pop = sum(len(df) for df in test_dfs)
+        
+        # 初始化MPRINT功能（传入日志文件路径）
+        self.mprint = MPrint(enable=enable_mprint, prefix="MPRINT", log_file=log_file)
+
+    # 新增析构函数：确保程序结束时关闭日志文件
+    def __del__(self):
+        self.mprint.close()
+
+    # ========== 以下保留原有 _get_bin_metrics / solve_stage1 / repair_recursive 等方法 ==========
+    # （原有代码不变，此处省略，完整代码见文末）
+
+# 修改验证函数：添加日志文件参数
+def calculate_bin_metrics_to_df(cutoffs, train_dfs, test_dfs, enable_mprint=True, log_file=None):
+    """
+    Binning verification core function: calculate all bin statistics based on given score cutoffs, return 4 DataFrames
+    Parameters:
+        cutoffs (list[float]): Sorted score bin boundaries (output from solve function, ascending order)
+        train_dfs (list[pd.DataFrame]): List of 10 train datasets (each contains 'score' and 'target' columns)
+        test_dfs (list[pd.DataFrame]): List of 6 validation datasets (each contains 'score' and 'target' columns)
+        enable_mprint (bool): Whether to enable MPRINT-like output
+        log_file (str): Path to log file for MPRINT output
+    Returns:
+        df_single_train (pd.DataFrame): Statistics of each bin in 10 individual train sets
+        df_single_val (pd.DataFrame): Statistics of each bin in 6 individual validation sets
+        df_merge_train (pd.DataFrame): Statistics of merged 10 train sets by bin
+        df_merge_val (pd.DataFrame): Statistics of merged 6 validation sets by bin
+    """
+    # 初始化验证模块的MPrint（指定日志文件）
+    mprint = MPrint(enable=enable_mprint, prefix="MPRINT[VALIDATE]", log_file=log_file)
+    mprint.print("Starting bin metrics validation")
+    mprint.print(f"  Cutoffs: {[f'{x:.4f}' for x in cutoffs]}")
+    mprint.print(f"  Train datasets: {len(train_dfs)}, Test datasets: {len(test_dfs)}")
+
+    # ========== 以下保留原有验证逻辑 ==========
+    # （原有代码不变，此处省略）
+
+    # 关闭验证模块的日志文件句柄
+    mprint.close()
+    return df_single_train, df_single_val, df_merge_train, df_merge_val
+
+# ========== 执行部分：指定日志文件路径 ==========
+def gen_data(n, seed):
+    np.random.seed(seed)
+    s = np.random.randint(300, 850, n)
+    # Target prob decreases as score increases
+    p = 1 / (1 + np.exp((s - 580) / 50))
+    return pd.DataFrame({'pd': p, 'target': np.random.binomial(1, p)})
+
+# Generate 16 datasets
+train_sets = [gen_data(2000, i) for i in range(10)]
+test_sets = [gen_data(1000, i+10) for i in range(6)]
+
+# 指定日志文件路径（关键）
+LOG_FILE_PATH = "binning_mprint.log"  # 日志会写入当前目录的 binning_mprint.log 文件
+
+# Run Framework with MPRINT enabled (写入日志文件)
+model = AdvancedBinningFramework(
+    train_sets, test_sets, 
+    a=0.05, b=0.25, 
+    enable_mprint=True, 
+    log_file=LOG_FILE_PATH  # 传入日志文件路径
+)
+stage1_cuts = model.solve_stage1()
+
+final_cuts = model.repair_recursive(stage1_cuts)
+model.final_report(final_cuts)
+df = model.summary(final_cuts)
+
+# Run validation with MPRINT enabled (同样写入日志文件)
+df_single_train, df_single_val, df_merge_train, df_merge_val = calculate_bin_metrics_to_df(
+    final_cuts, train_sets, test_sets, 
+    enable_mprint=True, 
+    log_file=LOG_FILE_PATH  # 传入日志文件路径
+)
