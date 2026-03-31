@@ -589,3 +589,61 @@ df_single_train, df_single_val, df_merge_train, df_merge_val = calculate_bin_met
     enable_mprint=True, 
     log_file=LOG_FILE_PATH  # 传入日志文件路径
 )
+
+
+#%%
+
+
+import pandas as pd
+import numpy as np
+import logging
+from logging.handlers import RotatingFileHandler  # 支持日志文件大小轮转
+
+# 配置日志器（可复用）
+def setup_mprint_logger(prefix="MPRINT", log_file=None, max_bytes=10*1024*1024, backup_count=5):
+    """
+    配置MPRINT日志器：
+    - 同时输出到控制台和文件
+    - 支持日志文件大小轮转（超过10MB自动切割，保留5个备份）
+    """
+    logger = logging.getLogger(prefix)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # 避免重复输出
+
+    # 避免重复添加处理器
+    if logger.handlers:
+        return logger
+
+    # 格式器：匹配原有MPrint输出格式
+    formatter = logging.Formatter(f"{prefix}: %(message)s")
+
+    # 1. 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # 2. 文件处理器（支持轮转）
+    if log_file:
+        file_handler = RotatingFileHandler(
+            log_file, encoding='utf-8', 
+            maxBytes=max_bytes, backupCount=backup_count
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+class MPrint:
+    """基于logging模块的MPrint实现"""
+    def __init__(self, enable=True, prefix="MPRINT", log_file=None):
+        self.enable = enable
+        self.logger = setup_mprint_logger(prefix, log_file)
+
+    def print(self, content):
+        if self.enable:
+            self.logger.info(content)
+
+# ========== 后续 AdvancedBinningFramework / calculate_bin_metrics_to_df / 执行逻辑 与方案1一致 ==========
+# 仅需将 MPrint 类替换为上述实现，其余代码无需修改
+
+#%%
