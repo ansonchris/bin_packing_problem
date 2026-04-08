@@ -1,147 +1,192 @@
 import pandas as pd
 import numpy as np
+import warnings
+
+# Suppress pandas FutureWarnings for clean output
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 class BinningOptimizer:
-    def __init__(self, min_wo_ratio=0.10, target_bins=5):
-        self.min_wo_ratio = min_wo_ratio
-        self.target_bins = target_bins
-        self.first_bin_boundary = None
-        self.all_boundaries = None
+    def __init__(self, min_write_off_ratio=0.10, initial_rest_bins=10):
+        """
+        Args:
+            min_write_off_ratio: Minimum proportion of write-offs required in the first bin.
+            initial_rest_bins: Number of granular bins to initialize for the remaining data 
+                               before agglomerative merging for monotonicity.
+        """
+        self.min_write_off_ratio = min_write_off_ratio
+        self.initial_rest_bins = initial_rest_bins
+        self.first_bin_cutoff = None
+        self.final_boundaries = None
 
-    def fit(self, df):
+    def _find_critical_cutoff(self, df):
+        """Step 1: Maximize first bin width subject to C1 and C2 for all samples."""
         samples = df['sample'].unique()
+        totals_wo = df.groupby('sample')['write_off'].sum()
         
-        # 1. Generate search candidates (percentiles 1 through 50)
-        # We search the lower half of the score distribution for the "Risk Bin"
-        potential_cuts = np.percentile(df['score'], np.linspace(1, 50, 100))
+        # Evaluate at 1000 quantiles to balance speed and precision
+        candidates = df['score'].quantile(np.linspace(0, 1, 1000)).unique()
         
         best_cutoff = None
-        diagnostic_log = []
-
-        for cut in potential_cuts:
-            sample_status = []
-            all_pass = True
+        
+        # Iterate from highest possible score down to lowest to MAXIMIZE the bin width
+        for cut in reversed(candidates):
+            c1_passed = True
+            c2_passed = True
             
             for s in samples:
-                sub = df[(df['sample'] == s) & (df['score'] <= cut)]
-                if sub.empty:
-                    all_pass = False
-                    continue
+                # Filter first bin for current sample
+                mask = (df['sample'] == s) & (df['score'] <= cut)
+                sub_bin = df[mask]
                 
-                # Metrics
-                la_return = sub['return'].sum() - sub['loss'].sum()
-                wo_pct = sub['write_off'].sum() / df[df['sample'] == s]['write_off'].sum()
-                
-                # Constraints
-                c1 = la_return < 0
-                c2 = wo_pct >= self.min_wo_ratio
-                
-                if not (c1 and c2):
-                    all_pass = False
-                
-                sample_status.append({'sample': s, 'C1_pass': c1, 'C2_pass': c2, 'LAR': la_return, 'WO%': wo_pct})
-            
-            if all_pass:
-                best_cutoff = cut # Keep expanding to maximize width
-            else:
-                # If we already found a best_cutoff and now it's failing, we stop.
-                if best_cutoff is not None:
+                # Constraint 1: Loss-adjusted return < 0
+                la_return = sub_bin['return'].sum() - sub_bin['loss'].sum()
+                if la_return >= 0:
+                    c1_passed = False
                     break
-                # Otherwise, keep a log of why we are failing for the first few cuts
-                if len(diagnostic_log) < 5:
-                    diagnostic_log.append({'cutoff': cut, 'status': sample_status})
-
-        if best_cutoff is None:
-            print("\n--- DIAGNOSTIC ALERT: Optimization Failed ---")
-            print("Check the first candidate cutoff results:")
-            diag_df = pd.DataFrame(diagnostic_log[0]['status'])
-            print(diag_df.to_string(index=False))
-            print("\nPossible Issues: ")
-            print("- If LAR is > 0: Your riskiest bin is already profitable. C1 is impossible.")
-            print("- If WO% is < 10%: The bin is too narrow. C2 is impossible.")
-            raise ValueError("Could not find a valid first bin. See diagnostics above.")
-        
-        self.first_bin_boundary = best_cutoff
-        
-        # 2. Define Remaining Boundaries
-        remaining_scores = df[df['score'] > best_cutoff]['score']
-        other_cuts = np.percentile(remaining_scores, np.linspace(0, 100, self.target_bins))
-        boundaries = np.sort(np.unique(np.concatenate([[df['score'].min() - 1e-5], [best_cutoff], other_cuts])))
-        
-        # 3. Monotonicity (Default Rate Increasing)
-        self.all_boundaries = self._adjust_for_monotonicity(df, boundaries, samples)
-        return self.all_boundaries
-
-    def _adjust_for_monotonicity(self, df, bins, samples):
-        current_bins = list(bins)
-        while len(current_bins) > 3:
-            failed_idx = -1
-            for s in samples:
-                temp = df[df['sample'] == s].copy()
-                temp['b'] = pd.cut(temp['score'], bins=current_bins)
-                dr = temp.groupby('b', observed=False)['is_default'].mean().values
+                    
+                # Constraint 2: Write-off >= min_write_off_ratio
+                # Handle division by zero if total write_off is 0
+                total_wo = totals_wo[s]
+                wo_ratio = (sub_bin['write_off'].sum() / total_wo) if total_wo > 0 else 0
                 
+                if wo_ratio < self.min_write_off_ratio:
+                    c2_passed = False
+                    break
+                    
+            if c1_passed and c2_passed:
+                best_cutoff = cut
+                break # Since we iterate in reverse, the first match is the maximum possible width
+                
+        if best_cutoff is None:
+            raise ValueError("No cutoff found that satisfies both C1 (<0 return) and C2 (write-off ratio) for all samples.")
+            
+        return best_cutoff
+
+    def _ensure_monotonicity(self, df):
+        """Step 2: Iteratively merge remaining bins to satisfy C3 across all samples."""
+        samples = df['sample'].unique()
+        
+        # Data outside the first bin
+        df_rest = df[df['score'] > self.first_bin_cutoff]
+        if df_rest.empty:
+            return [df['score'].min() - 1e-5, self.first_bin_cutoff, df['score'].max() + 1e-5]
+            
+        # Create initial granular boundaries for the rest of the data
+        rest_quantiles = np.linspace(0, 1, self.initial_rest_bins + 1)[1:] 
+        rest_boundaries = df_rest['score'].quantile(rest_quantiles).unique().tolist()
+        
+        boundaries = [df['score'].min() - 1e-5, self.first_bin_cutoff] + rest_boundaries
+        boundaries[-1] += 1e-5 # Ensure max value is captured
+        
+        while len(boundaries) > 3: # Need at least: Min, First Cutoff, Max
+            monotonic = True
+            merge_idx = -1
+            
+            for s in samples:
+                sample_df = df[df['sample'] == s].copy()
+                
+                # Assign data to current bins
+                sample_df['bin'] = pd.cut(sample_df['score'], bins=boundaries, include_lowest=True)
+                
+                # Calculate default rate (Constraint 3)
+                dr = sample_df.groupby('bin', observed=False)['is_default'].mean().fillna(0).values
+                
+                # Check if strictly non-decreasing
                 for i in range(len(dr) - 1):
-                    if dr[i] >= dr[i+1]: # Violation: We want DR to increase
-                        # Do not remove the first boundary (the optimized one)
-                        failed_idx = i + 1 if (i + 1) != 1 else i + 2
+                    if dr[i] >= dr[i+1]:
+                        monotonic = False
+                        
+                        if i == 0:
+                            # CRITICAL: If Bin 1 > Bin 2, we CANNOT alter boundary 1 (first_bin_cutoff)
+                            # because it was optimized for C1 and C2.
+                            # Instead, we merge Bin 2 and Bin 3 to raise the default rate of the second bin.
+                            merge_idx = 2 
+                        else:
+                            # Merge bin `i` and `i+1` by dropping the boundary between them
+                            merge_idx = i + 1 
                         break
-                if failed_idx != -1: break
-            
-            if failed_idx == -1: break
-            if failed_idx >= len(current_bins): failed_idx = len(current_bins) - 1
-            current_bins.pop(failed_idx)
-            
-        return current_bins
+                
+                if not monotonic:
+                    break # Break sample loop to perform the merge
+                    
+            if monotonic:
+                break # All samples passed C3
+            else:
+                # Execute merge by removing the violating boundary
+                boundaries.pop(merge_idx)
+                
+        return boundaries
+
+    def fit(self, df):
+        """Executes the full binning optimization logic."""
+        print("Finding critical point for First Bin...")
+        self.first_bin_cutoff = self._find_critical_cutoff(df)
+        print(f"First bin upper boundary locked at score: {self.first_bin_cutoff:.4f}")
+        
+        print("Optimizing remaining bins for monotonic default rates...")
+        self.final_boundaries = self._ensure_monotonicity(df)
+        print(f"Final optimal boundaries: {self.final_boundaries}")
+        
+        return self.final_boundaries
+
 
 # ==========================================
-# Robust Data Generation (Ensures a "Red" Bin exists)
+# Example Usage & Dummy Data Generation
 # ==========================================
-def generate_robust_data():
-    samples = ['Dev'] + [f'Test_{i}' for i in range(1, 7)]
-    all_data = []
-    for s in samples:
-        n = 5000
-        score = np.random.uniform(300, 850, n)
-        
-        # Higher score = Lower Default Prob
-        p = 1 / (1 + np.exp((score - 550) / 60))
-        is_default = np.random.binomial(1, p)
-        
-        # LOSS: Very high for scores < 400
-        loss = np.where(score < 420, np.random.uniform(800, 1200), np.random.uniform(0, 50))
-        # RETURN: Low for scores < 400
-        ret = np.where(score < 420, np.random.uniform(0, 50), np.random.uniform(100, 400))
-        wo = np.where(score < 450, np.random.uniform(50, 100), np.random.uniform(1, 10))
-        
-        all_data.append(pd.DataFrame({
-            'sample': s, 'score': score, 'is_default': is_default,
-            'loss': loss, 'return': ret, 'write_off': wo
-        }))
-    return pd.concat(all_data)
-
-# Run the process
-df = generate_robust_data()
-opt = BinningOptimizer(min_wo_ratio=0.10, target_bins=6)
-
-try:
-    final_bins = opt.fit(df)
+if __name__ == "__main__":
+    np.random.seed(42)
     
-    # Generate report
-    report_list = []
-    for s in df['sample'].unique():
-        sdf = df[df['sample'] == s].copy()
-        sdf['bin'] = pd.cut(sdf['score'], bins=final_bins)
-        stats = sdf.groupby('bin', observed=False).agg(
-            DR=('is_default', 'mean'),
-            LAR=('return', lambda x: x.sum() - sdf.loc[x.index, 'loss'].sum()),
-            WO_Pct=('write_off', lambda x: x.sum() / sdf['write_off'].sum())
+    # Generate mock data: 1 dev sample, 6 test samples
+    samples = ['dev'] + [f'test_{i}' for i in range(1, 7)]
+    data = []
+    
+    for s in samples:
+        n_obs = 5000
+        # Score from 0 to 1000
+        score = np.random.normal(500, 150, n_obs)
+        
+        # Loss and Return (lower scores = higher loss, lower return)
+        loss = np.random.uniform(50, 200, n_obs) - (score * 0.1)
+        ret = np.random.uniform(0, 100, n_obs) + (score * 0.1)
+        
+        # Write off expenses
+        write_off = np.random.uniform(10, 50, n_obs)
+        
+        # Default flag (probability of default heavily increases with score for demonstration)
+        prob_default = 1 / (1 + np.exp(-(score - 500) / 100))
+        is_default = np.random.binomial(1, prob_default)
+        
+        df_temp = pd.DataFrame({
+            'sample': s, 'score': score, 'return': ret, 'loss': loss, 
+            'write_off': write_off, 'is_default': is_default
+        })
+        data.append(df_temp)
+        
+    df_all = pd.concat(data, ignore_index=True)
+    
+    # Run the Optimizer
+    optimizer = BinningOptimizer(min_write_off_ratio=0.10, initial_rest_bins=15)
+    
+    try:
+        final_bins = optimizer.fit(df_all)
+        
+        # Display Results for the Development Sample
+        dev_df = df_all[df_all['sample'] == 'dev'].copy()
+        dev_df['final_bin'] = pd.cut(dev_df['score'], bins=final_bins)
+        
+        results = dev_df.groupby('final_bin', observed=False).agg(
+            obs_count=('score', 'count'),
+            total_return=('return', 'sum'),
+            total_loss=('loss', 'sum'),
+            write_off_sum=('write_off', 'sum'),
+            default_rate=('is_default', 'mean')
         ).reset_index()
-        stats.insert(0, 'sample', s)
-        report_list.append(stats)
-
-    print("\n--- SUCCESS! Final Validated Bins ---")
-    print(pd.concat(report_list).to_string(index=False))
-
-except ValueError as e:
-    print(e)
+        
+        results['loss_adj_return'] = results['total_return'] - results['total_loss']
+        results['write_off_pct'] = results['write_off_sum'] / results['write_off_sum'].sum()
+        
+        print("\n--- Validation on Dev Sample ---")
+        print(results[['final_bin', 'obs_count', 'loss_adj_return', 'write_off_pct', 'default_rate']])
+        
+    except ValueError as e:
+        print(e)
